@@ -36,8 +36,14 @@ import streamlit as st
 
 
 # Generate charts button colours. Set these to CSS colours, for example "#16803c".
-GENERATE_BUTTON_COLOR = "#32AAFF"
+GENERATE_BUTTON_COLOR = "#FF4B4B"  # Streamlit's default primary control colour.
 GENERATE_BUTTON_TEXT_COLOR = "#ffffff"
+CHART_BORDER_COLOR = "#B8BEC7"
+
+
+def add_plot_border(ax):
+    """Frame the plotting area without outlining secondary label axes."""
+    ax.spines[:].set(visible=True, color=CHART_BORDER_COLOR, linewidth=1, zorder=10)
 
 
 @st.cache_resource
@@ -699,8 +705,7 @@ def type0_plot_gantt(df_priority, segment, today=None, date_label="Today",
     ax.set_facecolor("white")
     ax.set_axisbelow(True)
     ax.grid(axis="x", color="#E5E5E5", linewidth=0.6)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+    add_plot_border(ax)
     ax.set_yticks([])
     ax.set_ylim(len(gantt) - 0.5, -0.5)
     ax.tick_params(axis="x", colors=GREY, labelsize=8, length=0)
@@ -1389,6 +1394,7 @@ def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_s
     fig = Figure(figsize=(max(12, len(years) * 1.7), 6 + legend_rows * 0.3), facecolor="white")
     FigureCanvasAgg(fig)
     ax = fig.add_subplot()
+    ax.set_facecolor("white")
     fig.suptitle(title, fontsize=16, fontweight="bold", color=GREY, y=0.98)
     bars = [(year, metric) for year in years for metric in ("PAS", "PIAS")]
     positions = [index + offset for index in range(len(years)) for offset in (-0.2, 0.2)]
@@ -1438,10 +1444,10 @@ def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_s
     ax.set_ylabel(f"Value ({IPD_PIPELINE_UNIT})", color=GREY)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
     ax.tick_params(axis="both", length=0, colors=GREY)
-    ax.grid(axis="y", color="#E8EBEF", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    ax.grid(axis="both", which="major", color="#E8EBEF", linewidth=0.8, zorder=0)
     ax.axhline(0, color="#B8BEC7", linewidth=0.8, zorder=2)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+    add_plot_border(ax)
     ax.set_xlim(-0.65, len(years) - 0.35)
     lower, upper = min(negative), max(positive)
     span = upper - lower or 1
@@ -1578,8 +1584,7 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
     ax.set_facecolor("white")
     ax.set_axisbelow(True)
     ax.grid(axis="x", color="#E5E5E5", linewidth=0.6)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+    add_plot_border(ax)
     limits = limits if limits is not None else ipd_timeline_limits(projects, milestones, today, cutoff)
     if cutoff is not None:
         lower = mdates.date2num(cutoff)
@@ -1897,8 +1902,13 @@ def time_to_market_figure(values, mode):
         xaxis_title="Month-end · solid: actual · dashed: forecast · n: launches in rolling window",
         yaxis_title="Average time to market (years)",
         legend=dict(orientation="h", y=-0.25, x=0, groupclick="togglegroup"),
-        hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", uirevision="time-to-market-monthly")
-    figure.update_yaxes(tickformat=".1f", rangemode="tozero")
+        hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", plot_bgcolor="white",
+        uirevision="time-to-market-monthly")
+    figure.update_xaxes(showgrid=True, gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    figure.update_yaxes(tickformat=".1f", rangemode="tozero", showgrid=True,
+                        gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
     return figure
 
 
@@ -1908,6 +1918,7 @@ def time_to_market_png(chart):
         figure = Figure(figsize=(12, 5.5), facecolor="white")
         FigureCanvasAgg(figure)
         ax = figure.subplots()
+        ax.set_facecolor("white")
         figure.subplots_adjust(left=0.08, right=0.97, bottom=0.27, top=0.88)
         for trace in chart.data:
             # Match connectgaps=True without inventing values for missing months.
@@ -1939,9 +1950,8 @@ def time_to_market_png(chart):
         ax.set_ylabel(chart.layout.yaxis.title.text, color="#35445a")
         ax.tick_params(axis="both", length=0, colors="#35445a", labelsize=9)
         ax.set_axisbelow(True)
-        ax.grid(color="#E8EBEF", linewidth=0.8)
-        for spine in ax.spines.values():
-            spine.set_visible(False)
+        ax.grid(axis="both", which="major", color="#E8EBEF", linewidth=0.8)
+        add_plot_border(ax)
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             figure.legend(handles, labels, loc="lower left", bbox_to_anchor=(0.07, 0.01),
@@ -2276,9 +2286,14 @@ def pipeline_figure(values, mode):
     figure.update_layout(template="plotly_white", title=f"{MODES[mode]} pipeline", barmode="relative",
                          height=530, margin=dict(l=60, r=25, t=70, b=100), font=dict(family="Arial, sans-serif", color="#35445a"),
                          yaxis_title="Value (k EUR)", legend=dict(orientation="h", y=-0.22, x=0),
-                         hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", uirevision="pipeline")
-    figure.update_xaxes(type="multicategory", title=None)
-    figure.update_yaxes(tickformat=",.0f", rangemode="tozero")
+                         hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", plot_bgcolor="white",
+                         uirevision="pipeline")
+    figure.update_xaxes(type="multicategory", title=None, tickson="labels", showgrid=True,
+                        gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    figure.update_yaxes(tickformat=",.0f", rangemode="tozero", showgrid=True,
+                        gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
     return figure
 
 
@@ -2292,14 +2307,20 @@ APP_CSS = """
 .stApp { background:#f3f6fb; }
 [data-testid=stHeader] { display:none; }
 .stMainBlockContainer { max-width:1900px; padding:2rem 30px 2.5rem; }
-.st-key-brand { min-height:45px; }
-.st-key-brand h1 { color:#32AAFF; font-size:25px; letter-spacing:-.7px;
+.st-key-brand { min-height:64px; padding:12px 14px; box-sizing:border-box;
+  background:#32AAFF; border:1px solid #32AAFF; border-radius:14px; }
+.st-key-brand h1 { color:#ffffff; font-size:22px; letter-spacing:-.7px;
   display:flex; align-items:center; line-height:1.2; margin:0; padding:0; }
 .st-key-mode [role=radiogroup] { justify-content:center; }
 .st-key-mode, .st-key-controls, .st-key-results { background:white; border-radius:14px; }
 .st-key-mode h2, .st-key-controls h2 { font-size:16px; }
+.st-key-mode { padding:8px 14px; }
+.st-key-mode h2 { margin:0; padding:0; line-height:1.25; }
+.st-key-mode [role=radiogroup], .st-key-mode [role=radiogroup] label { margin-block:0; }
 .st-key-workbook_header [data-testid=stMarkdownContainer] { margin:0; }
 .st-key-workbook_header h2 { margin:0; padding:0; line-height:1.25; }
+/* Adjust the container's 16px gap to 15px above and 20px below the separator. */
+.st-key-controls hr { margin:-1px 0 4px; }
 .st-key-controls h3 { font-size:14px; border-top:1px solid #edf0f5; padding-top:20px; }
 .st-key-controls [data-testid=stWidgetLabel] p { font-size:12px; font-weight:600; color:#495b74; }
 .st-key-controls [data-testid=stFileUploaderDropzone] { background:#f8faff;
@@ -2332,7 +2353,8 @@ APP_CSS += f"""
   background:transparent url("data:image/svg+xml;base64,{LOGO_BASE64}") center / contain no-repeat;
 }}
 .st-key-brand h1::before {{ content:''; display:block; flex-shrink:0;
-  width:45px; height:45px; margin-right:14px; }}
+  width:36px; height:36px; margin-right:10px; border-radius:50%;
+  background-color:white; background-size:26px 26px; }}
 .st-key-workbook_header [data-testid=stBaseButton-primary] {{
   background:{GENERATE_BUTTON_COLOR}; border-color:{GENERATE_BUTTON_COLOR};
   color:{GENERATE_BUTTON_TEXT_COLOR};
@@ -2721,11 +2743,11 @@ def main():
     st.set_page_config(page_title="Portfolio Analysis", page_icon="▥", layout="wide")
     st.html(APP_CSS)
     page = st.container(key="portfolio_page", gap=2)
-    with page.container(key="brand"):
-        st.title("Portfolio Analysis")
     with page.container(key="workspace"):
         sidebar, content = st.columns([1, 3.6], gap="small")
-        with sidebar, st.container(border=True, key="mode"):
+        with sidebar, st.container(key="brand"):
+            st.title("Portfolio Analysis")
+        with sidebar, st.container(border=True, key="mode", gap=20):
             st.markdown("## Project portfolio")
             mode = st.radio("Portfolio", list(MODES), format_func=MODES.get, key="portfolio_mode",
                              horizontal=True, label_visibility="collapsed")
@@ -2735,6 +2757,7 @@ def main():
                 st.markdown(f"## {MODES[mode]} workbook", width="stretch")
                 with st.container(width=150):
                     generate_slot = st.empty()
+            st.divider()
             loaded = load_workbook(mode)
             count_slot = st.empty()
             values = scope_controls(mode, loaded[2] if loaded else None)
