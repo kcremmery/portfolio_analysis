@@ -1538,6 +1538,11 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
                         if index == 0 or phase.casefold() != phases[index - 1].casefold()}
     else:
         phase_starts = {}
+    status_column = next((column for column in projects
+                          if ipd_cell_text(column).casefold() == "project status"), None)
+    statuses = (projects[status_column].map(ipd_cell_text).str.casefold()
+                if status_column is not None else pd.Series("", index=projects.index))
+    launched = statuses.eq("launched") & ipd_project_phases(projects).eq("Post Launch")
     reference_date = pd.Timestamp(reference_date or today or date.today()).normalize()
     cutoff = pd.Timestamp(start_date).normalize() if start_date is not None else None
     event_groups = []
@@ -1668,7 +1673,7 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
             tick.set_ha("left")
 
     gate_font = FontProperties(family="DejaVu Sans", size=7)
-    for (_, row), y, groups in zip(projects.iterrows(), positions, event_groups):
+    for (_, row), y, groups, is_launched in zip(projects.iterrows(), positions, event_groups, launched):
         if row["Valid dates"]:
             ax.plot([row["Start"], row["End"]], [y, y], color=IPD_BAR_COLOUR,
                     linewidth=4.5, solid_capstyle="round", zorder=2)
@@ -1682,8 +1687,11 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
                 event_y = y + (index - (len(group) - 1) / 2) * 24
                 past_colour = IPD_PAST_GATE_FILL if marker == "D" else IPD_PAST_LAUNCH_FILL
                 outline_colour = IPD_EVENT_GREEN if marker == "D" else IPD_LAUNCH_OUTLINE
+                fill_colour = past_colour if stamp <= reference_date else "white"
+                if marker == "^" and is_launched:
+                    outline_colour = fill_colour = IPD_EVENT_GREEN
                 ax.plot(stamp, event_y, marker=marker, markersize=IPD_EVENT_SIZE,
-                        markerfacecolor=past_colour if stamp <= reference_date else "white",
+                        markerfacecolor=fill_colour,
                         markeredgecolor=outline_colour, markeredgewidth=1.3,
                         linestyle="none", zorder=5, label=label, clip_on=False)
                 label_width = renderer.get_text_width_height_descent(label, gate_font, False)[0]
@@ -1712,7 +1720,9 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
                Line2D([], [], color=IPD_EVENT_GREEN, marker="D", markersize=IPD_EVENT_SIZE,
                       markerfacecolor="white", linestyle="none", label="Future gates"),
                Line2D([], [], color=IPD_LAUNCH_OUTLINE, marker="^", markersize=IPD_EVENT_SIZE,
-                      markerfacecolor="white", linestyle="none", label=IPD_END_LABEL)]
+                      markerfacecolor="white", linestyle="none", label="Planned launch date"),
+               Line2D([], [], color=IPD_EVENT_GREEN, marker="^", markersize=IPD_EVENT_SIZE,
+                      markerfacecolor=IPD_EVENT_GREEN, linestyle="none", label="Launched")]
     if today is not None:
         handles.append(Line2D([], [], color=TODAY_COLOUR, linestyle="--", linewidth=0.8,
                               label=f"Today ({ipd_format_date(pd.Timestamp(today))})"))
@@ -1738,32 +1748,36 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 TIME_TO_MARKET_COLUMNS = ["Month end", "Segment", "Period", "Time to market (years)", "KPI",
                           "Launch count", "Actual launches", "Planned launches", "Launches this month"]
 
-OTMD_TAB = "On-time milestone delivery"
-OTMD_CALCULATION_VERSION = 8
+OTMD_TAB = "Milestones on-time"
+OTMD_CALCULATION_VERSION = 13
 OTMD_ACTUAL = "Gate date in the period"
 OTMD_BASELINE = "Gate date @ Baseline"
 OTMD_SEGMENT = "Market segment"
 OTMD_COLUMNS = ["Month end", "Segment", "On-time milestones", "Total milestones", "OTMD (%)",
-                "Moving 12-month average (%)", "Months in average"]
+                "Moving 12-month average (%)", "Months in average", "Days late"]
 
 
-def monthly_kpi_xaxis(months):
-    """Align monthly grid lines with KPI points, labelling Jan/Apr/Jul/Oct only."""
+def monthly_kpi_xaxis(months, all_months=False):
+    """Align monthly grid lines with KPI points, optionally labelling every month."""
     months = pd.DatetimeIndex(months).dropna()
     ticks = pd.date_range(months.min(), months.max(), freq="ME").tolist() if len(months) else []
     axis = dict(type="date", tickformat="%b\n%Y", tickmode="array", tickvals=ticks,
-                ticktext=[f"{month:%b}<br>{month:%Y}" if month.month in (1, 4, 7, 10) else ""
-                          for month in ticks], tickangle=0)
+                ticktext=[f"{month:%b}<br>{month:%Y}" if all_months or month.month in (1, 4, 7, 10) else ""
+                          for month in ticks], tickangle=-45 if all_months else 0)
     if ticks:
         axis["range"] = [ticks[0] - pd.Timedelta(days=15), ticks[-1] + pd.Timedelta(days=15)]
     return axis
 
 
 def monthly_kpi_png_xaxis(ax, chart):
-    """Use the interactive chart's monthly grid and quarterly labels in downloads."""
+    """Use the interactive chart's monthly grid and labels in downloads."""
     axis = chart.layout.xaxis
     ax.set_xticks(list(axis.tickvals or []),
                   [label.replace("<br>", "\n") for label in (axis.ticktext or [])])
+    if axis.tickangle:
+        ax.tick_params(axis="x", labelrotation=-axis.tickangle)
+        for label in ax.get_xticklabels():
+            label.set_ha("right")
     if axis.range:
         ax.set_xlim(*axis.range)
 
@@ -1831,6 +1845,9 @@ def ipd_otmd_monthly_values(milestones, calendar_months=None, segment="Total"):
     monthly = monthly.reindex(calendar_months, fill_value=0)
     values = monthly.rename(columns={"sum": "On-time milestones", "size": "Total milestones"})
     values["OTMD (%)"] = 100 * values["On-time milestones"] / values["Total milestones"].replace(0, np.nan)
+    # Preserve the requested sign: baseline minus completion; late dates are negative.
+    days_late = (milestones[OTMD_BASELINE] - milestones[OTMD_ACTUAL]).dt.days
+    values["Days late"] = days_late.groupby(months).mean().reindex(calendar_months)
     rolling = values["OTMD (%)"].rolling(12, min_periods=1)
     values["Moving 12-month average (%)"] = rolling.mean()
     # Require 12 calendar months of history, not 12 non-empty monthly percentages.
@@ -1841,11 +1858,13 @@ def ipd_otmd_monthly_values(milestones, calendar_months=None, segment="Total"):
     return values.reset_index(drop=True)[OTMD_COLUMNS]
 
 
-def otmd_figure(values):
-    """Compare Total and selected segments using monthly dots and moving-average lines."""
+def otmd_figure(values, milestone_count=None, *, show_monthly=True, show_segments=True):
+    """Compare moving averages with Total monthly OTMD and signed calendar-day differences."""
     figure = go.Figure()
     fallback = ["#52B788", "#9B72CF", "#36A6A6", "#E76F51"]
     for index, (segment, rows) in enumerate(values.groupby("Segment", sort=False)):
+        if segment != "Total" and not show_segments:
+            continue
         rows = rows.sort_values("Month end")
         months = rows["Month end"].tolist()
         averages = rows["Moving 12-month average (%)"]
@@ -1855,7 +1874,9 @@ def otmd_figure(values):
         figure.add_scatter(
             name=segment, legendgroup=segment, showlegend=True, x=months,
             y=[float(value) if pd.notna(value) else None for value in averages],
-            mode="lines", connectgaps=False, line=dict(color=colour, width=2.5 if segment == "Total" else 2),
+            mode="lines", connectgaps=False,
+            line=dict(color=colour, width=2.5 if segment == "Total" else 2,
+                      dash="solid" if segment == "Total" else "dot", shape="spline", smoothing=0.7),
             text=labels,
             customdata=[[segment, count] for count in rows["Months in average"]],
             hovertemplate=("%{customdata[0]} · %{x|%b %Y}<br>12-month average: %{y:.1f}%<br>"
@@ -1863,45 +1884,104 @@ def otmd_figure(values):
         for month, value, label in zip(months, averages, labels):
             if label:
                 add_kpi_label(figure, month, float(value), label, colour)
+        if segment == "Total" and show_monthly:
+            figure.add_scatter(
+                name="Total - monthly MOT", legendgroup="monthly-otmd", showlegend=True, x=months,
+                y=[float(value) if pd.notna(value) else None for value in rows["OTMD (%)"]],
+                mode="markers", marker=dict(color=colour, size=9, symbol="circle"),
+                customdata=[[segment, on_time, total] for on_time, total in
+                            rows[["On-time milestones", "Total milestones"]].itertuples(index=False, name=None)],
+                hovertemplate=("%{customdata[0]} · %{x|%b %Y}<br>OTMD: %{y:.1f}%<br>"
+                               "%{customdata[1]} on time / %{customdata[2]} milestones<extra></extra>"))
+    total = values.loc[values["Segment"].eq("Total")].sort_values("Month end")
+    if milestone_count is None:
+        milestone_count = int(total["Total milestones"].sum())
+    if not total.empty:
         figure.add_scatter(
-            name=f"{segment} · monthly OTMD", legendgroup=segment, showlegend=False, x=months,
-            y=[float(value) if pd.notna(value) else None for value in rows["OTMD (%)"]],
-            mode="markers", marker=dict(color=colour, size=9 if segment == "Total" else 7),
-            customdata=[[segment, on_time, total] for on_time, total in
-                        rows[["On-time milestones", "Total milestones"]].itertuples(index=False, name=None)],
-            hovertemplate=("%{customdata[0]} · %{x|%b %Y}<br>OTMD: %{y:.1f}%<br>"
-                           "%{customdata[1]} on time / %{customdata[2]} milestones<extra></extra>"))
+            name="Days late / early", legendgroup="monthly-days-late", showlegend=True,
+            x=total["Month end"].tolist(),
+            y=[float(value) if pd.notna(value) else None for value in total["Days late"]],
+            yaxis="y2", mode="markers",
+            marker=dict(color="white", size=10, symbol="triangle-up",
+                        line=dict(color="#3066E3", width=1.8)),
+            customdata=total["Total milestones"].tolist(),
+            hovertemplate=("Total · %{x|%b %Y}<br>Days late: %{y:.1f} calendar days<br>"
+                           "Baseline − gate date in the period<br>%{customdata} milestones<extra></extra>"))
     figure.update_layout(
-        template="plotly_white", title="IPD on-time milestone delivery (OTMD)", height=550,
-        margin=dict(l=60, r=35, t=70, b=105), font=dict(family="Arial, sans-serif", color="#35445a"),
-        xaxis_title="Completion month · lines: 12-month average · dots: monthly OTMD",
+        template="plotly_white", height=600,
+        title=dict(text="Milestones On-Time", font=dict(weight="bold"),
+                   subtitle=dict(text=f"Number of milestones: {milestone_count:,}",
+                                 font=dict(size=13, weight="normal"))),
+        margin=dict(l=60, r=75, t=100, b=140), font=dict(family="Arial, sans-serif", color="#35445a"),
+        xaxis_title="Completion month",
         yaxis_title="On-time milestone delivery (%)",
-        legend=dict(orientation="h", y=-0.25, x=0, groupclick="togglegroup"), hoverlabel=dict(bgcolor="white"),
+        legend=dict(orientation="h", y=-0.35, x=0, groupclick="togglegroup"), hoverlabel=dict(bgcolor="white"),
         paper_bgcolor="white", plot_bgcolor="white", uirevision="otmd-monthly")
-    figure.update_xaxes(**monthly_kpi_xaxis(values["Month end"]), hoverformat="%b %Y",
+    figure.update_xaxes(**monthly_kpi_xaxis(values["Month end"], all_months=True), hoverformat="%b %Y",
                         showgrid=True, gridcolor="#E8EBEF", gridwidth=1,
                         showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
     figure.update_yaxes(range=[-5, 115], tickvals=list(range(0, 101, 20)), ticksuffix="%",
                         showgrid=True, gridcolor="#E8EBEF", gridwidth=1,
                         showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    figure.update_layout(yaxis2=dict(
+        title=dict(text="Days late (-) / early(+)", font=dict(color="#3066E3")), tickfont=dict(color="#3066E3"),
+        overlaying="y", side="right", rangemode="tozero", showgrid=False, zeroline=False,
+        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1))
     return figure
 
 
+def otmd_curve_points(months, values, smoothing=0.7):
+    """Sample smooth cubic curves through monthly values without bridging missing data."""
+    x, y = mdates.date2num(months), np.asarray(values, dtype=float)
+    edges = np.diff(np.r_[False, np.isfinite(y), False].astype(int))
+    curve_x, curve_y = [], []
+    for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        run_x, run_y = x[start:end], y[start:end]
+        if len(run_x) > 2:
+            slopes = np.gradient(run_y, run_x) * smoothing
+            t = np.linspace(0, 1, 24, endpoint=False)
+            widths = np.diff(run_x)[:, None]
+            sample_x = run_x[:-1, None] + widths * t
+            sample_y = ((2 * t**3 - 3 * t**2 + 1) * run_y[:-1, None]
+                        + (t**3 - 2 * t**2 + t) * widths * slopes[:-1, None]
+                        + (-2 * t**3 + 3 * t**2) * run_y[1:, None]
+                        + (t**3 - t**2) * widths * slopes[1:, None])
+            curve_x.extend(sample_x.ravel())
+            curve_y.extend(sample_y.ravel())
+            curve_x.append(run_x[-1])
+            curve_y.append(run_y[-1])
+        else:
+            curve_x.extend(run_x)
+            curve_y.extend(run_y)
+        curve_x.append(np.nan)
+        curve_y.append(np.nan)
+    return curve_x, curve_y
+
+
 def otmd_png(chart):
-    """Match the interactive monthly dots and rolling-average line in the PNG download."""
+    """Match the interactive axes, monthly markers and rolling-average lines in downloads."""
     with render_lock():
-        figure = Figure(figsize=(12, 5.5), facecolor="white")
+        figure = Figure(figsize=(12, 6), facecolor="white")
         FigureCanvasAgg(figure)
         ax = figure.subplots()
-        figure.subplots_adjust(left=0.08, right=0.97, bottom=0.27, top=0.88)
+        days_ax = ax.twinx()
+        figure.subplots_adjust(left=0.08, right=0.91, bottom=0.32, top=0.84)
         for trace in chart.data:
+            target_ax = days_ax if trace.yaxis == "y2" else ax
             y = [np.nan if value is None else value for value in trace.y]
             label = trace.name if trace.showlegend else "_nolegend_"
             if trace.mode == "markers":
-                ax.plot(trace.x, y, linestyle="none", marker="o", markersize=trace.marker.size * 2 / 3,
-                        color=trace.marker.color, label=label, zorder=3)
+                target_ax.plot(
+                    trace.x, y, linestyle="none",
+                    marker="^" if trace.marker.symbol == "triangle-up" else "o",
+                    markersize=trace.marker.size * 2 / 3, markerfacecolor=trace.marker.color,
+                    markeredgecolor=trace.marker.line.color or trace.marker.color,
+                    markeredgewidth=trace.marker.line.width or 1,
+                    color=trace.marker.color, label=label, zorder=3)
             else:
-                ax.plot(trace.x, y, color=trace.line.color, linewidth=trace.line.width, label=label)
+                curve_x, curve_y = otmd_curve_points(trace.x, y, trace.line.smoothing)
+                target_ax.plot(curve_x, curve_y, color=trace.line.color, linewidth=trace.line.width,
+                               linestyle=":" if trace.line.dash == "dot" else "-", label=label)
                 for stamp, value, label in zip(trace.x, y, trace.text):
                     if label:
                         ax.annotate(label, (stamp, value), xytext=(0, 7), textcoords="offset points",
@@ -1913,22 +1993,46 @@ def otmd_png(chart):
         ax.set_ylim(*chart.layout.yaxis.range)
         ax.set_yticks(range(0, 101, 20))
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}%"))
-        ax.set_title(chart.layout.title.text, loc="left", pad=20, color="#35445a")
+        ax.set_title(chart.layout.title.text, loc="left", pad=36, color="#35445a", fontweight="bold")
+        ax.text(0, 1.04, chart.layout.title.subtitle.text, transform=ax.transAxes,
+                ha="left", va="bottom", fontsize=10, color="#35445a")
         ax.set_xlabel(chart.layout.xaxis.title.text, labelpad=12, fontsize=9, color="#35445a")
         ax.set_ylabel(chart.layout.yaxis.title.text, color="#35445a")
+        days_ax.set_ylabel(chart.layout.yaxis2.title.text, color=chart.layout.yaxis2.title.font.color)
+        lower, upper = days_ax.get_ylim()
+        days_ax.set_ylim(min(lower, 0), max(upper, 0))
+        days_ax.tick_params(axis="y", length=0, colors=chart.layout.yaxis2.tickfont.color, labelsize=9)
+        days_ax.grid(False)
+        days_ax.spines[:].set_visible(False)
         ax.tick_params(axis="both", length=0, colors="#35445a", labelsize=9)
         ax.set_axisbelow(True)
         ax.grid(axis="both", color="#E8EBEF", linewidth=0.8)
         add_plot_border(ax)
         if chart.data:
             figure.legend(loc="lower left", bbox_to_anchor=(0.07, 0.01),
-                          ncol=min(5, sum(bool(trace.showlegend) for trace in chart.data)),
+                          ncol=min(4, sum(bool(trace.showlegend) for trace in chart.data)),
                           frameon=False, fontsize=9)
         return figure_png(figure)
 
 
 def otmd_settings_key(source, sheet, header_row):
     return (source["digest"], source["name"], sheet, header_row, OTMD_CALCULATION_VERSION)
+
+
+def update_otmd_display(result, show_monthly=True, show_segments=True):
+    """Keep the chart and downloads in sync while retaining all calculated values."""
+    values = result["values"]
+    chart = otmd_figure(values, milestone_count=result["count"],
+                        show_monthly=show_monthly, show_segments=show_segments)
+    displayed = values if show_segments else values.loc[values["Segment"].eq("Total")]
+    if not show_monthly:
+        displayed = displayed.drop(columns="OTMD (%)")
+    assets = {"On_time_milestone_delivery.csv":
+              displayed.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")}
+    if not values.empty:
+        assets["Type_IPD_OTMD.png"] = otmd_png(chart)
+    result.update(chart=chart, assets=assets, displayed_values=displayed,
+                  display_options=(show_monthly, show_segments))
 
 
 def build_otmd_results(source, sheet, header_row, milestones, start_date=None, segments=None):
@@ -1949,14 +2053,11 @@ def build_otmd_results(source, sheet, header_row, milestones, start_date=None, s
     start_date = pd.Timestamp(start_date).normalize().date() if start_date is not None else None
     if start_date is not None:
         values = values.loc[values["Month end"].ge(pd.Timestamp(start_date))].reset_index(drop=True)
-    chart = otmd_figure(values)
-    assets = {"On_time_milestone_delivery.csv":
-              values.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")}
-    if not values.empty:
-        assets["Type_IPD_OTMD.png"] = otmd_png(chart)
-    return dict(values=values, chart=chart, assets=assets, count=len(milestones),
-                source_name=source["name"], sheet=sheet, start_date=start_date, segments=selected_segments,
-                fingerprint=otmd_settings_key(source, sheet, header_row))
+    result = dict(values=values, count=len(milestones), source_name=source["name"], sheet=sheet,
+                  start_date=start_date, segments=selected_segments,
+                  fingerprint=otmd_settings_key(source, sheet, header_row))
+    update_otmd_display(result)
+    return result
 
 
 def load_data(mode, source, sheet):
@@ -2127,7 +2228,8 @@ def time_to_market_figure(values, mode):
                             add_kpi_label(figure, month, value, label, colour)
         figure.update_xaxes(hoverformat="%d %b %Y")
     figure.update_layout(
-        template="plotly_white", title=f"{MODES[mode]} time to market · rolling 12 months", height=550,
+        template="plotly_white", title=f"{MODES[mode]} time to market · rolling 12 months",
+        title_font=dict(weight="bold"), height=550,
         margin=dict(l=60, r=35, t=70, b=105), font=dict(family="Arial, sans-serif", color="#35445a"),
         xaxis_title="Month-end · solid: actual · dashed: forecast · n: launches in rolling window",
         yaxis_title="Average time to market (years)",
@@ -2177,7 +2279,7 @@ def time_to_market_png(chart):
         monthly_kpi_png_xaxis(ax, chart)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.1f}"))
         ax.set_ylim(bottom=0, top=max(1, ax.get_ylim()[1]) * 1.12)
-        ax.set_title(chart.layout.title.text, loc="left", pad=20, color="#35445a")
+        ax.set_title(chart.layout.title.text, loc="left", pad=20, color="#35445a", fontweight="bold")
         ax.set_xlabel(chart.layout.xaxis.title.text, labelpad=12, fontsize=9, color="#35445a")
         ax.set_ylabel(chart.layout.yaxis.title.text, color="#35445a")
         ax.tick_params(axis="both", length=0, colors="#35445a", labelsize=9)
@@ -2360,9 +2462,9 @@ def select_scope(mode, data, values):
 
 
 def settings_key(source, sheet, options):
-    # Pagination changes the chart layout, not the generated project selection.
+    # Planning display controls update existing charts without regenerating the project selection.
     payload = [source["digest"], source["name"], sheet,
-               {key: value for key, value in options.items() if key != "rows_per_page"}]
+               {key: value for key, value in options.items() if key not in {"rows_per_page", "show_today"}}]
     return sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -2416,16 +2518,17 @@ def planning_assets(result, mode):
     return groups, assets
 
 
-def repaginate_results(result, rows_per_page):
+def update_planning_results(result, rows_per_page, show_today):
     """Replace Gantt pages and the ZIP while retaining the generated filter scope."""
     if rows_per_page not in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100):
         raise ValueError("Choose 10, 20, 30, 40, 50, 60, 70, 80, 90, or 100 projects per chart.")
     updated = result.copy()
     if result["mode"] == "type0":
+        updated["chart_request"] = {**result["chart_request"], "show_today": show_today}
         with render_lock():
-            updated.update(type0_build_web_results(**result["chart_request"], rows_per_page=rows_per_page))
+            updated.update(type0_build_web_results(**updated["chart_request"], rows_per_page=rows_per_page))
     else:
-        updated["settings"] = {**result["settings"], "rows_per_page": rows_per_page}
+        updated["settings"] = {**result["settings"], "rows_per_page": rows_per_page, "show_today": show_today}
         build_ipd_results(updated)
     groups, charts = planning_assets(updated, result["mode"])
     previous_pages = {filename for group in result["groups"] for filename in group["pages"]}
@@ -2518,7 +2621,8 @@ def pipeline_figure(values, mode):
             tops.append(float(numbers.clip(lower=0).sum()))
         figure.add_scatter(x=x, y=tops, text=totals, mode="text", textposition="top center",
                            textfont=dict(color="black"), showlegend=False, hoverinfo="skip", cliponaxis=False)
-    figure.update_layout(template="plotly_white", title=f"{MODES[mode]} pipeline", barmode="relative",
+    figure.update_layout(template="plotly_white", title=f"{MODES[mode]} pipeline",
+                         title_font=dict(weight="bold"), barmode="relative",
                          height=530, margin=dict(l=60, r=25, t=70, b=100), font=dict(family="Arial, sans-serif", color="#35445a"),
                          yaxis_title="Value (k EUR)", legend=dict(orientation="h", y=-0.22, x=0),
                          hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", plot_bgcolor="white",
@@ -2867,7 +2971,6 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
                 "N includes and labels projects created on or after this date. Clear to disable N.")
         values["reporting_date"] = controls.values.get("reporting_date", initial["reporting_date"])
         if active_tab not in {"Pipeline", "Time to market"}:
-            st.subheader("Chart settings")
             day("reporting_date", "Reporting date")
     else:
         multiselect("phases")
@@ -2879,12 +2982,10 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
         values["order"] = st.session_state.get(controls.prefix + "order",
                                                controls.values.get("order", initial["order"]))
         controls.values["order"] = values["order"]
-        if planning_active:
-            st.subheader("Chart settings")
     values["rows"] = Controls(mode, "planning").values.get("rows", initial["rows"])
-    values["show_today"] = controls.values.get("show_today", True)
-    if planning_active:
-        values["show_today"] = controls.widget("checkbox", "show_today", "Show today", True, disabled=data is None)
+    values["show_today"] = st.session_state.get(controls.prefix + "show_today",
+                                               controls.values.get("show_today", True))
+    controls.values["show_today"] = values["show_today"]
     return values
 
 
@@ -2979,21 +3080,24 @@ def show_otmd(start_date=None, segments=()):
     if stale:
         st.warning("Milestone workbook settings, Start date or Segment changed. Generate charts to apply them. "
                    "Previous OTMD results are shown; OTMD downloads are disabled.")
-    source_name = result.get("source_name", view["source"]["name"])
-    st.caption(f"{source_name} · {result['count']:,} milestones")
-    if result.get("start_date") is not None:
-        st.caption(f"Month-ends from {result['start_date']:%d %b %Y}. "
-                   "Earlier milestones remain included in the moving-average calculation.")
     if result["values"].empty:
         st.info("No OTMD month-ends on or after the selected Start date."
                 if result["count"] and result.get("start_date") is not None
                 else "No milestones available for the current selection.")
         return
-    with st.container(horizontal=True, horizontal_alignment="right"):
+    downloads = st.container(horizontal=True, horizontal_alignment="right")
+    chart = st.container()
+    with st.container(horizontal=True):
+        show_monthly = controls.widget("checkbox", "show_monthly", "Show monthly MOT", True)
+        show_segments = controls.widget("checkbox", "show_segments", "Show segment MOT", True)
+    if result.get("display_options") != (show_monthly, show_segments):
+        update_otmd_display(result, show_monthly, show_segments)
+    with downloads:
         download("Download chart", result, "Type_IPD_OTMD.png", stale, "otmd_png")
         download("Download monthly data", result, "On_time_milestone_delivery.csv", stale, "otmd_csv")
-    st.plotly_chart(result["chart"], theme=None, width="stretch", key="otmd_ipd",
-                    config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
+    with chart:
+        st.plotly_chart(result["chart"], theme=None, width="stretch", key="otmd_ipd",
+                        config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
     with st.expander("Calculation"):
         st.caption(
             "Monthly OTMD = on-time milestones ÷ total milestones completed in the month × 100. "
@@ -3005,22 +3109,30 @@ def show_otmd(start_date=None, segments=()):
             "previous 11 calendar months. The first 11 calendar months of the selected history are blank; the moving average "
             "starts in month 12 and is recalculated every month, including months without milestones. "
             "Start date limits the displayed month-ends; earlier history still contributes to the average. "
-            "All series use the same calendar window. Rounded monthly labels show Total; hover any segment "
-            "line or dot for its percentage and counts. "
+            "All series use the same calendar window. Rounded monthly labels show the Total moving average. "
+            "The Total line is solid and segment lines are dotted; filled dots show monthly Total OTMD. "
+            "White-filled triangles with blue borders show monthly Total Days late on the right axis: "
+            "the average of Gate date @ Baseline "
+            "minus Gate date in the period across all milestones completed that month. Negative values mean late "
+            "completion; positive values mean early completion. Hover lines or markers for values and counts. "
             "Empty months contribute no monthly "
             "percentage to the average and have no dot. A 12-month window with no milestones has no average.")
     with st.expander("Monthly KPI and milestone counts"):
-        data_table(result["values"].sort_values("Month end", ascending=False), controls, "monthly")
+        data_table(result["displayed_values"].sort_values("Month end", ascending=False), controls, "monthly")
 
 
 def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
     mode = result["mode"]
     controls = Controls(mode, f"results_{result['generation']}")
     planning = Controls(mode, "planning")
+    view = portfolio_state(mode)
+    selection = Controls(mode, f"selection_{view.get('selection_revision', 0)}")
+    chart_settings = result["chart_request"] if mode == "type0" else result["settings"]
     rows_per_page = st.session_state.get(planning.prefix + "rows", planning.values.get("rows", 30))
-    if rows_per_page != result.get("rows_per_page", 30):
+    show_today = st.session_state.get(selection.prefix + "show_today", selection.values.get("show_today", True))
+    if rows_per_page != result.get("rows_per_page", 30) or show_today != chart_settings["show_today"]:
         with st.spinner("Updating chart pages and downloads…"):
-            repaginate_results(result, rows_per_page)
+            update_planning_results(result, rows_per_page, show_today)
     show_metrics(result)
     with st.container(border=True, key="results"):
         labels = ["Project planning", "Pipeline", "Time to market", "Projects", "Checks & actions"]
@@ -3049,8 +3161,6 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
                                                 options=pages, format_func=lambda value: f"{value} of {len(pages)}",
                                                 disabled=not pages, width=180)
                         if mode == "ipd":
-                            view = portfolio_state(mode)
-                            selection = Controls(mode, f"selection_{view.get('selection_revision', 0)}")
                             selection.widget("selectbox", "order", "Project order", "Excel order",
                                              options=["Excel order", "Start date", IPD_END_LABEL, "Activity label"],
                                              width=180)
@@ -3062,6 +3172,7 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
                     if page:
                         st.caption(f"{group['label']} · {group['count']:,} projects · Page {page} of {len(pages)}")
                         st.image(result["assets"][filename], width="stretch")
+                    selection.widget("checkbox", "show_today", "Show today", True)
                     if mode == "type0":
                         with st.expander("Segment summary"):
                             data_table(result["summary"], controls, "summary")
