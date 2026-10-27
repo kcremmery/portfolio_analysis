@@ -987,9 +987,8 @@ IPD_LAUNCH_METRICS = {"S": "PAS@5YM (UA) Project", "I": "PIAS@5YM (UA) Project"}
 IPD_LAUNCH_VALUES_PER_MILLION = 1_000
 IPD_PIPELINE_UNIT = "k EUR"
 IPD_DEFAULT_HEADER_ROW = 2
+IPD_IMPORT_VERSION = 2  # Preserve source years and accept variable financial horizons.
 IPD_FINANCIAL_METRICS = ("PAC", "PAS", "PIAC", "PIAS")
-IPD_YEAR_COLUMNS = [f"Year {year}" for year in range(1, 12)]
-IPD_FINANCIAL_COLUMNS = [f"{metric}_{year}" for metric in IPD_FINANCIAL_METRICS for year in IPD_YEAR_COLUMNS]
 IPD_BAR_COLOUR = "#32AAFF"
 IPD_EVENT_GREEN = "#52DEAD"
 IPD_PAST_GATE_FILL = "#DCF8EF"
@@ -1197,19 +1196,27 @@ def ipd_financial_value(value):
 
 
 def ipd_financial_year_mapping(headings):
-    """Resolve labelled years without treating neighbouring metadata as amounts."""
+    """Locate any number of year columns, retaining their actual year labels."""
+    headings = [ipd_cell_text(heading) for heading in headings]
     calendar = [(int(heading), index) for index, heading in enumerate(headings)
                 if re.fullmatch(r"[12]\d{3}", heading)]
     relative = [(int(match.group(1)), index) for index, heading in enumerate(headings)
-                if (match := re.fullmatch(r"Year\s+(\d+)", heading, re.IGNORECASE))]
+                if (match := re.fullmatch(r"Year\s+([1-9]\d*)", heading, re.IGNORECASE))]
     if not calendar and not relative:
         return {}  # Project-only workbooks need no yearly financial columns.
+    if calendar and relative:
+        raise ValueError("Financial headings mix calendar years and relative years. "
+                         "Use either calendar years (for example 2023, 2024) or Year 1, Year 2, etc.")
     years = sorted(calendar or relative)
-    expected = list(range(years[0][0], years[0][0] + 11)) if calendar else list(range(1, 12))
-    if (calendar and relative) or [year for year, _ in years] != expected:
-        raise ValueError("Financial columns must have eleven unique consecutive calendar-year headings "
-                         "(for example 2026–2036), or Year 1–Year 11. Check the header row.")
-    return {index: year for (_, index), year in zip(years, IPD_YEAR_COLUMNS)}
+    if len({year for year, _ in years}) != len(years):
+        raise ValueError("Duplicate financial year headings. Give each year a unique column.")
+    return {index: str(year) if calendar else f"Year {year}" for year, index in years}
+
+
+def ipd_financial_columns(projects):
+    """Find the imported metric/year columns without assuming a fixed horizon."""
+    return [column for column in projects
+            if re.fullmatch(r"(?:PAC|PAS|PIAC|PIAS)_(?:[12]\d{3}|Year [1-9]\d*)", str(column))]
 
 
 def ipd_consolidate_sections(frame, header_row, initial_metric=None):
@@ -1220,10 +1227,12 @@ def ipd_consolidate_sections(frame, header_row, initial_metric=None):
     nonblank value and include the conflicting source cell in the issue table.
     """
     fields, gates = ipd_resolve_columns(list(frame.columns))
+    year_columns = list(ipd_financial_year_mapping(frame.columns).values())
+    financial_columns = [f"{metric}_{year}" for metric in IPD_FINANCIAL_METRICS for year in year_columns]
     date_columns = {fields[IPD_START], fields[IPD_END], *(column for columns in gates.values() for column in columns)}
     # Type identifies the financial section; Total sum belongs to that metric.
     # Neither is a shared project attribute or an individual year's amount.
-    shared_columns = [column for column in frame if column not in IPD_YEAR_COLUMNS
+    shared_columns = [column for column in frame if column not in year_columns
                       and column.casefold() not in {"type", "total sum"}
                       and not column.startswith("__column_")]
     records, rows_by_project, problems = {}, {}, []
@@ -1236,7 +1245,7 @@ def ipd_consolidate_sections(frame, header_row, initial_metric=None):
         # Some exports repeat the header at the start of every section.
         if tag.casefold() == IPD_PROJECT.casefold() and description.casefold() == IPD_DESCRIPTION.casefold():
             continue
-        titles = {metric for column, value in row.items() if column not in IPD_YEAR_COLUMNS
+        titles = {metric for column, value in row.items() if column not in year_columns
                   and (metric := ipd_section_metric(value)) is not None}
         has_project_details = bool(
             (description and not ipd_section_metric(description))
@@ -1262,7 +1271,7 @@ def ipd_consolidate_sections(frame, header_row, initial_metric=None):
 
         if key not in records:
             records[key] = {column: "" for column in shared_columns}
-            records[key].update(dict.fromkeys(IPD_FINANCIAL_COLUMNS, pd.NA))
+            records[key].update(dict.fromkeys(financial_columns, pd.NA))
             rows_by_project[key] = []
         record = records[key]
         rows_by_project[key].append(excel_row)
@@ -1279,7 +1288,7 @@ def ipd_consolidate_sections(frame, header_row, initial_metric=None):
                 same = same or (pd.notna(first_date) and pd.notna(next_date) and first_date == next_date)
             if not same:
                 issue(column, incoming, f"Conflicting project value across sections; kept '{ipd_cell_text(previous)}'.")
-        for year in IPD_YEAR_COLUMNS:
+        for year in year_columns:
             value = row[year]
             if not ipd_cell_text(value):
                 continue
@@ -1298,9 +1307,9 @@ def ipd_consolidate_sections(frame, header_row, initial_metric=None):
             elif previous != number:
                 issue(column, value, f"Conflicting value for this project and metric; kept {previous:g}. Values are not summed.")
 
-    consolidated = pd.DataFrame(records.values(), columns=[*shared_columns, *IPD_FINANCIAL_COLUMNS])
+    consolidated = pd.DataFrame(records.values(), columns=[*shared_columns, *financial_columns])
     consolidated["Source rows"] = [", ".join(map(str, rows)) for rows in rows_by_project.values()]
-    for column in IPD_FINANCIAL_COLUMNS:
+    for column in financial_columns:
         consolidated[column] = pd.array(consolidated[column], dtype="Float64")
     source_rows = [rows[0] for rows in rows_by_project.values()]
     return consolidated, source_rows, pd.DataFrame(problems, columns=IPD_ISSUE_COLUMNS)
@@ -1320,15 +1329,12 @@ def ipd_read_workbook(content, sheet_name, header_row=IPD_DEFAULT_HEADER_ROW):
         headings[index] = year
     frame = raw.iloc[header_row:].copy()
     frame.columns = headings
-    for year in IPD_YEAR_COLUMNS:
-        if year not in frame:
-            frame[year] = ""
     initial_titles = [metric for value in raw.iloc[:header_row - 1].to_numpy().flat
                       if (metric := ipd_section_metric(value)) is not None]
     consolidated, source_rows, section_issues = ipd_consolidate_sections(
         frame, header_row, initial_metric=initial_titles[-1] if initial_titles else None)
     projects, milestones, issues = ipd_prepare_projects(consolidated, header_row, source_rows)
-    for column in IPD_FINANCIAL_COLUMNS:
+    for column in ipd_financial_columns(projects):
         projects[column] = pd.array(projects[column], dtype="Float64")
     return projects, milestones, pd.concat([section_issues, issues], ignore_index=True)
 
@@ -1534,7 +1540,8 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
     if group_by_phase:
         projects = ipd_order_projects_by_phase(projects)
         phases = ipd_project_phases(projects).tolist()
-        phase_starts = {index: phase or "Unspecified" for index, phase in enumerate(phases)
+        phase_labels = {phase: f"[G{gate}] {phase}" for gate, phase in enumerate(IPD_PHASE_ORDER, start=1)}
+        phase_starts = {index: phase_labels.get(phase, phase or "Unspecified") for index, phase in enumerate(phases)
                         if index == 0 or phase.casefold() != phases[index - 1].casefold()}
     else:
         phase_starts = {}
@@ -1652,9 +1659,13 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
     spacing = min((right - left for left, right in zip(summary_positions, summary_positions[1:])),
                   default=ax.bbox.width)
     summary_labels = []
-    for parts in summary_parts:
+    for year, parts in zip(map(int, year_labels), summary_parts):
         label = " ".join(parts)
-        if renderer.get_text_width_height_descent(label, summary_font, False)[0] + 12 > spacing:
+        # A partial first/last year has less room than the distance between year centres.
+        visible_start = max(limits[0], mdates.date2num(date(year, 1, 1)))
+        visible_end = min(limits[1], mdates.date2num(date(year + 1, 1, 1)))
+        year_width = (visible_end - visible_start) / (limits[1] - limits[0]) * ax.bbox.width
+        if renderer.get_text_width_height_descent(label, summary_font, False)[0] + 12 > min(spacing, year_width):
             label = "\n".join(parts)
         summary_labels.append(label)
     summary_axis = ax.secondary_xaxis("bottom")
@@ -1749,12 +1760,45 @@ TIME_TO_MARKET_COLUMNS = ["Month end", "Segment", "Period", "Time to market (yea
                           "Launch count", "Actual launches", "Planned launches", "Launches this month"]
 
 OTMD_TAB = "Milestones on-time"
-OTMD_CALCULATION_VERSION = 13
+POT_TAB = "Projects on-time"
+ON_TIME_TABS = (OTMD_TAB, POT_TAB)
+OTMD_CALCULATION_VERSION = 16
 OTMD_ACTUAL = "Gate date in the period"
 OTMD_BASELINE = "Gate date @ Baseline"
 OTMD_SEGMENT = "Market segment"
+OTMD_GATE = "Gate in Horizon"
+OTMD_BASELINE_GATE = "Gate @ baseline"
 OTMD_COLUMNS = ["Month end", "Segment", "On-time milestones", "Total milestones", "OTMD (%)",
                 "Moving 12-month average (%)", "Months in average", "Days late"]
+POT_COLUMN_NAMES = {"On-time milestones": "On-time projects", "Total milestones": "Total projects",
+                    "OTMD (%)": "POT (%)"}
+
+
+def on_time_labels(projects_only=False):
+    """Keep shared charts, tables and exports labelled for their KPI population."""
+    if projects_only:
+        return dict(title="Projects On-Time", noun="projects", unit="G5 gates", short="POT", metric="POT (%)",
+                    on_time="On-time projects", total="Total projects", state="projects_result",
+                    png="Type_IPD_Projects_On_Time.png", csv="Projects_on_time.csv")
+    return dict(title="Milestones On-Time", noun="milestones", unit="milestones", short="MOT", metric="OTMD (%)",
+                on_time="On-time milestones", total="Total milestones", state="result",
+                png="Type_IPD_OTMD.png", csv="On_time_milestone_delivery.csv")
+
+
+def ipd_g5_milestones(milestones):
+    """Select G5, including export labels that explicitly identify the G4 baseline."""
+    if OTMD_GATE not in milestones:
+        raise ValueError("Projects on-time needs a 'Gate in Horizon' or 'Gate @ baseline' column in the milestone worksheet "
+                         "to identify G5 records (for example G5, Gate 5 or 5).")
+    if milestones.empty:
+        return milestones.copy()
+    gates = milestones[OTMD_GATE].map(type0_cell_text).str.casefold().str.partition("@")
+    is_g5 = gates[0].str.strip().str.match(r"^(?:g(?:ate)?\s*)?5(?:\.0)?(?:$|[\s(:–—-])")
+    baseline = gates[2].str.replace(r"\s+", "", regex=True)
+    # Plain G5 labels use the workbook's G4-fixed baseline. If the export names
+    # the baseline gate explicitly, accept G4 only (for example G5@BaselineG4).
+    baseline_at_g4 = gates[1].eq("") | baseline.str.fullmatch(r"baseline(?:g(?:ate)?)?4")
+    return milestones.loc[is_g5 & baseline_at_g4].copy()
 
 
 def monthly_kpi_xaxis(months, all_months=False):
@@ -1824,6 +1868,12 @@ def ipd_read_otmd_workbook(content, sheet_name, header_row=2):
         canonical = {name.casefold(): name for name in SEGMENT_COLOURS}
         names = raw[segment_column].map(lambda value: re.sub(r"\s+", " ", type0_cell_text(value)).strip())
         milestones[OTMD_SEGMENT] = names.map(lambda name: canonical.get(name.casefold(), name)).to_numpy()
+    gate_column = next((lookup[name] for name in (
+        OTMD_GATE.casefold(), OTMD_BASELINE_GATE.casefold(), "gate", "gate in the period",
+        "gate name", "gate number", "milestone", "milestone name")
+        if name in lookup), None)
+    if gate_column is not None:
+        milestones[OTMD_GATE] = raw[gate_column].map(type0_cell_text).to_numpy()
     return milestones
 
 
@@ -1858,8 +1908,9 @@ def ipd_otmd_monthly_values(milestones, calendar_months=None, segment="Total"):
     return values.reset_index(drop=True)[OTMD_COLUMNS]
 
 
-def otmd_figure(values, milestone_count=None, *, show_monthly=True, show_segments=True):
+def otmd_figure(values, milestone_count=None, *, show_monthly=True, show_segments=True, projects_only=False):
     """Compare moving averages with Total monthly OTMD and signed calendar-day differences."""
+    kpi = on_time_labels(projects_only)
     figure = go.Figure()
     fallback = ["#52B788", "#9B72CF", "#36A6A6", "#E76F51"]
     for index, (segment, rows) in enumerate(values.groupby("Segment", sort=False)):
@@ -1880,22 +1931,22 @@ def otmd_figure(values, milestone_count=None, *, show_monthly=True, show_segment
             text=labels,
             customdata=[[segment, count] for count in rows["Months in average"]],
             hovertemplate=("%{customdata[0]} · %{x|%b %Y}<br>12-month average: %{y:.1f}%<br>"
-                           "%{customdata[1]} months with milestones<extra></extra>"))
+                           "%{customdata[1]} months with " + kpi["unit"] + "<extra></extra>"))
         for month, value, label in zip(months, averages, labels):
             if label:
                 add_kpi_label(figure, month, float(value), label, colour)
         if segment == "Total" and show_monthly:
             figure.add_scatter(
-                name="Total - monthly MOT", legendgroup="monthly-otmd", showlegend=True, x=months,
-                y=[float(value) if pd.notna(value) else None for value in rows["OTMD (%)"]],
+                name=f"Total - monthly {kpi['short']}", legendgroup="monthly-otmd", showlegend=True, x=months,
+                y=[float(value) if pd.notna(value) else None for value in rows[kpi["metric"]]],
                 mode="markers", marker=dict(color=colour, size=9, symbol="circle"),
                 customdata=[[segment, on_time, total] for on_time, total in
-                            rows[["On-time milestones", "Total milestones"]].itertuples(index=False, name=None)],
-                hovertemplate=("%{customdata[0]} · %{x|%b %Y}<br>OTMD: %{y:.1f}%<br>"
-                               "%{customdata[1]} on time / %{customdata[2]} milestones<extra></extra>"))
+                            rows[[kpi["on_time"], kpi["total"]]].itertuples(index=False, name=None)],
+                hovertemplate=("%{customdata[0]} · %{x|%b %Y}<br>" + kpi["metric"].split()[0] + ": %{y:.1f}%<br>"
+                               "%{customdata[1]} on time / %{customdata[2]} " + kpi["unit"] + "<extra></extra>"))
     total = values.loc[values["Segment"].eq("Total")].sort_values("Month end")
     if milestone_count is None:
-        milestone_count = int(total["Total milestones"].sum())
+        milestone_count = int(total[kpi["total"]].sum())
     if not total.empty:
         figure.add_scatter(
             name="Days late / early", legendgroup="monthly-days-late", showlegend=True,
@@ -1904,19 +1955,22 @@ def otmd_figure(values, milestone_count=None, *, show_monthly=True, show_segment
             yaxis="y2", mode="markers",
             marker=dict(color="white", size=10, symbol="triangle-up",
                         line=dict(color="#3066E3", width=1.8)),
-            customdata=total["Total milestones"].tolist(),
+            customdata=total[kpi["total"]].tolist(),
             hovertemplate=("Total · %{x|%b %Y}<br>Days late: %{y:.1f} calendar days<br>"
-                           "Baseline − gate date in the period<br>%{customdata} milestones<extra></extra>"))
+                           + ("G5 baseline at G4 − G5 completion date" if projects_only
+                              else "Baseline − gate date in the period")
+                           + "<br>%{customdata} " + kpi["unit"] + "<extra></extra>"))
     figure.update_layout(
         template="plotly_white", height=600,
-        title=dict(text="Milestones On-Time", font=dict(weight="bold"),
-                   subtitle=dict(text=f"Number of milestones: {milestone_count:,}",
+        title=dict(text=kpi["title"], font=dict(weight="bold"),
+                   subtitle=dict(text=f"Number of {kpi['noun']}: {milestone_count:,}"
+                                 + (" · G5 gates against baseline at G4" if projects_only else ""),
                                  font=dict(size=13, weight="normal"))),
         margin=dict(l=60, r=75, t=100, b=140), font=dict(family="Arial, sans-serif", color="#35445a"),
         xaxis_title="Completion month",
-        yaxis_title="On-time milestone delivery (%)",
+        yaxis_title="Projects on-time (%)" if projects_only else "On-time milestone delivery (%)",
         legend=dict(orientation="h", y=-0.35, x=0, groupclick="togglegroup"), hoverlabel=dict(bgcolor="white"),
-        paper_bgcolor="white", plot_bgcolor="white", uirevision="otmd-monthly")
+        paper_bgcolor="white", plot_bgcolor="white", uirevision="pot-monthly" if projects_only else "otmd-monthly")
     figure.update_xaxes(**monthly_kpi_xaxis(values["Month end"], all_months=True), hoverformat="%b %Y",
                         showgrid=True, gridcolor="#E8EBEF", gridwidth=1,
                         showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
@@ -2021,22 +2075,26 @@ def otmd_settings_key(source, sheet, header_row):
 
 def update_otmd_display(result, show_monthly=True, show_segments=True):
     """Keep the chart and downloads in sync while retaining all calculated values."""
+    projects_only = result.get("projects_only", False)
+    labels = on_time_labels(projects_only)
     values = result["values"]
     chart = otmd_figure(values, milestone_count=result["count"],
-                        show_monthly=show_monthly, show_segments=show_segments)
+                        show_monthly=show_monthly, show_segments=show_segments, projects_only=projects_only)
     displayed = values if show_segments else values.loc[values["Segment"].eq("Total")]
     if not show_monthly:
-        displayed = displayed.drop(columns="OTMD (%)")
-    assets = {"On_time_milestone_delivery.csv":
+        displayed = displayed.drop(columns=labels["metric"])
+    assets = {labels["csv"]:
               displayed.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")}
     if not values.empty:
-        assets["Type_IPD_OTMD.png"] = otmd_png(chart)
+        assets[labels["png"]] = otmd_png(chart)
     result.update(chart=chart, assets=assets, displayed_values=displayed,
                   display_options=(show_monthly, show_segments))
 
 
-def build_otmd_results(source, sheet, header_row, milestones, start_date=None, segments=None):
+def build_otmd_results(source, sheet, header_row, milestones, start_date=None, segments=None, *, projects_only=False):
     """Filter milestone records, then calculate before applying the display cutoff."""
+    if projects_only:
+        milestones = ipd_g5_milestones(milestones)
     selected_segments = tuple(name for name in otmd_segment_names(milestones)
                               if segments is None or name in segments)
     if OTMD_SEGMENT in milestones:
@@ -2053,8 +2111,10 @@ def build_otmd_results(source, sheet, header_row, milestones, start_date=None, s
     start_date = pd.Timestamp(start_date).normalize().date() if start_date is not None else None
     if start_date is not None:
         values = values.loc[values["Month end"].ge(pd.Timestamp(start_date))].reset_index(drop=True)
+    if projects_only:
+        values = values.rename(columns=POT_COLUMN_NAMES)
     result = dict(values=values, count=len(milestones), source_name=source["name"], sheet=sheet,
-                  start_date=start_date, segments=selected_segments,
+                  start_date=start_date, segments=selected_segments, projects_only=projects_only,
                   fingerprint=otmd_settings_key(source, sheet, header_row))
     update_otmd_display(result)
     return result
@@ -2566,10 +2626,11 @@ def build_results(mode, source, sheet, data, options, selected):
         result = build_ipd_results(selected)
         projects = result["projects"]
         result.update(build_pipeline_results(projects, "IPD"))
-        tables = {"Projects.csv": projects.drop(columns=IPD_FINANCIAL_COLUMNS).rename(
+        financial_columns = ipd_financial_columns(projects)
+        tables = {"Projects.csv": projects.drop(columns=financial_columns).rename(
                     columns={"Start": IPD_START, "End": IPD_END_LABEL}),
                   "Milestones.csv": result["milestones"], "Checks_and_actions.csv": result["issues"],
-                  "Financial_metrics.csv": projects[[IPD_PROJECT, IPD_DESCRIPTION, *IPD_FINANCIAL_COLUMNS]]}
+                  "Financial_metrics.csv": projects[[IPD_PROJECT, IPD_DESCRIPTION, *financial_columns]]}
         result["missing_dates"] = int(projects["End"].isna().sum())
     groups, assets = planning_assets(result, mode)
     pipeline_name = "Type_0_Pipeline.png" if mode == "type0" else "Type_IPD_Pipeline.png"
@@ -2796,8 +2857,10 @@ def load_workbook(mode):
     sheets = source["sheets"]
     default = TYPE0_SHEET_NAME if mode == "type0" and TYPE0_SHEET_NAME in sheets else sheets[0]
     sheet = Controls(mode, "workbook").widget("selectbox", "sheet", "Worksheet", default, options=sheets)
-    if view.get("sheet") != sheet:
+    import_version = IPD_IMPORT_VERSION if mode == "ipd" else None
+    if view.get("sheet") != sheet or view.get("import_version") != import_version:
         view["sheet"] = sheet
+        view["import_version"] = import_version
         view["preferences"] = {"workbook": view["preferences"]["workbook"]}
         view.pop("result", None)
         view.pop("data", None)
@@ -2844,7 +2907,8 @@ def load_otmd_workbook():
     source = view.get("source")
     if source is None:
         st.caption(f"Required columns: {OTMD_ACTUAL} and {OTMD_BASELINE}. "
-                   f"Add {OTMD_SEGMENT} for segment comparisons. Headings default to row 2.")
+                   f"Add {OTMD_SEGMENT} for segment comparisons and {OTMD_GATE} for Projects on-time. "
+                   "For G5, the baseline must be the target fixed at G4. Headings default to row 2.")
         return None
     sheet = controls.widget("selectbox", "sheet", "Milestone worksheet", source["sheets"][0],
                             options=source["sheets"])
@@ -2854,9 +2918,18 @@ def load_otmd_workbook():
               on_click=clear_workbook, args=("otmd",))
     fingerprint = otmd_settings_key(source, sheet, header_row)
     if view.get("fingerprint") != fingerprint or ("data" not in view and not view.get("read_error")):
+        previous_fingerprint = view.get("fingerprint")
+        if previous_fingerprint is not None and previous_fingerprint[-1] != OTMD_CALCULATION_VERSION:
+            # Older gate matching could save an empty selection because it found
+            # no G5 rows. Let the corrected population initialize its segments.
+            selection = Controls("otmd", "projects_selection")
+            if not selection.values.get("segments"):
+                selection.values.pop("segments", None)
+                st.session_state.pop(selection.prefix + "segments", None)
         view.pop("data", None)
         view.pop("read_error", None)
         view.pop("generation_error", None)
+        view.pop("projects_error", None)
         try:
             view["data"] = ipd_read_otmd_workbook(source["content"], sheet, header_row)
         except Exception as exc:
@@ -2870,10 +2943,17 @@ def load_otmd_workbook():
     return source, sheet, header_row, view["data"]
 
 
-def otmd_segment_selection(milestones):
+def on_time_population(milestones, projects_only=False):
+    """Offer G5-only filter choices without blocking the other KPI if Gate is absent."""
+    if milestones is None or not projects_only:
+        return milestones
+    return ipd_g5_milestones(milestones) if OTMD_GATE in milestones else milestones.iloc[:0]
+
+
+def otmd_segment_selection(milestones, projects_only=False):
     """Keep milestone segment choices separate from the project population filters."""
-    choices = otmd_segment_names(milestones)
-    preferences = Controls("otmd", "selection").values
+    choices = otmd_segment_names(on_time_population(milestones, projects_only))
+    preferences = Controls("otmd", "projects_selection" if projects_only else "selection").values
     selected = tuple(name for name in choices if name in preferences.get("segments", choices))
     preferences["segments"] = list(selected)
     return selected
@@ -2888,12 +2968,15 @@ def active_result_tab(mode):
         return st.session_state.get(navigation.prefix + "active_tab",
                                     navigation.values.get("active_tab", "Project planning"))
     if mode == "ipd" and portfolio_state("otmd").get("result") is not None:
-        return OTMD_TAB
+        navigation = Controls("otmd", "navigation")
+        return st.session_state.get(navigation.prefix + "active_tab",
+                                    navigation.values.get("active_tab", OTMD_TAB))
     return None
 
 
 def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
-    otmd_active = mode == "ipd" and active_tab == OTMD_TAB
+    otmd_active = mode == "ipd" and active_tab in ON_TIME_TABS
+    projects_only = active_tab == POT_TAB
     if data is None and not otmd_active:
         return {}
     initial, choices = defaults(mode, data)
@@ -2903,13 +2986,15 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
         # Hidden project widgets are unmounted by Streamlit; use their durable saved values.
         values = {**initial, **controls.values}
         st.subheader("Chart filters", divider=False)
-        segment_choices = otmd_segment_names(otmd_milestones)
-        Controls("otmd", "selection").widget(
-            "multiselect", "segments", "Segment", list(otmd_segment_selection(otmd_milestones)),
+        segment_choices = otmd_segment_names(on_time_population(otmd_milestones, projects_only))
+        unit = "G5 gates" if projects_only else "milestones"
+        metric = "POT" if projects_only else "OTMD"
+        Controls("otmd", "projects_selection" if projects_only else "selection").widget(
+            "multiselect", "segments", "Segment", list(otmd_segment_selection(otmd_milestones, projects_only)),
             options=segment_choices, format_func=lambda name: name or "(Blank)",
             disabled=not segment_choices, placeholder="Choose segments…",
-            help="Use only milestones from the selected segments for Total and each segment's "
-                 "monthly OTMD and moving average. Select at least one segment to show results.")
+            help=f"Use only {unit} from the selected segments for Total and each segment's "
+                 f"monthly {metric} and moving average. Select at least one segment to show results.")
         if otmd_milestones is not None and OTMD_SEGMENT not in otmd_milestones:
             st.caption("Add a Market segment column to the milestone worksheet to compare segments. "
                        "Total is available without it.")
@@ -2917,7 +3002,7 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
             "date_input", "start_date", "Start date",
             parse_day(initial["start_date"], "start date") if data is not None else None,
             min_value=date(1900, 1, 1), max_value=date(2200, 12, 31), format="DD/MM/YYYY",
-            help="Show OTMD month-ends from this date. Earlier milestones still contribute to the moving average.")
+            help=f"Show {metric} month-ends from this date. Earlier {unit} still contribute to the moving average.")
         values["rows"] = Controls(mode, "planning").values.get("rows", initial["rows"])
         return values
     values = {}
@@ -2976,8 +3061,8 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
         multiselect("phases")
         multiselect("segments")
         day("start_date", "Start date",
-            "Include projects with a G1–G5 milestone on or after this date and show OTMD month-ends "
-            "from this date. Earlier milestones still contribute to the OTMD moving average.")
+            "Include projects with a G1–G5 milestone on or after this date and show on-time KPI month-ends "
+            "from this date. Earlier milestones still contribute to the moving averages.")
         # Read toolbar changes before selecting projects and checking stale results.
         values["order"] = st.session_state.get(controls.prefix + "order",
                                                controls.values.get("order", initial["order"]))
@@ -3060,68 +3145,82 @@ def show_metrics(result):
         column.metric(label, value)
 
 
-def show_otmd(start_date=None, segments=()):
-    """Present milestone results using the project Start date as the display cutoff."""
+def show_otmd(start_date=None, segments=(), *, projects_only=False):
+    """Present either on-time KPI using the shared Start date as the display cutoff."""
     view = portfolio_state("otmd")
-    controls = Controls("otmd", "results")
-    result = view.get("result")
+    labels = on_time_labels(projects_only)
+    metric = "POT" if projects_only else "OTMD"
+    controls = Controls("otmd", "projects_results" if projects_only else "results")
+    result = view.get(labels["state"])
+    if projects_only and view.get("projects_error"):
+        st.warning(view["projects_error"])
     if result is None:
         if view.get("source") is None:
             st.info("Upload a milestone workbook in the left pane.")
         elif view.get("upload_error") or view.get("read_error"):
             st.info("Correct the milestone workbook settings in the left pane to continue.")
-        else:
+        elif projects_only and view.get("data") is not None and OTMD_GATE not in view["data"]:
+            st.info("Projects on-time needs a 'Gate in Horizon' or 'Gate @ baseline' column in the milestone worksheet "
+                    "to identify G5 records (for example G5 or G5@BaselineG4). "
+                    "The existing baseline date column supplies the G5 target fixed at G4.")
+        elif not (projects_only and view.get("projects_error")):
             st.info("Your milestone workbook is ready. Select Generate charts in the left pane.")
         return
     stale = (bool(view.get("upload_error") or view.get("read_error")) or
+             bool(projects_only and view.get("projects_error")) or
              result.get("fingerprint") != view.get("fingerprint") or
              result.get("start_date") != start_date or
              result.get("segments", ()) != segments)
     if stale:
         st.warning("Milestone workbook settings, Start date or Segment changed. Generate charts to apply them. "
-                   "Previous OTMD results are shown; OTMD downloads are disabled.")
+                   f"Previous {metric} results are shown; {metric} downloads are disabled.")
     if result["values"].empty:
-        st.info("No OTMD month-ends on or after the selected Start date."
+        st.info(f"No {metric} month-ends on or after the selected Start date."
                 if result["count"] and result.get("start_date") is not None
-                else "No milestones available for the current selection.")
+                else f"No {labels['unit']} available for the current selection.")
         return
     downloads = st.container(horizontal=True, horizontal_alignment="right")
     chart = st.container()
     with st.container(horizontal=True):
-        show_monthly = controls.widget("checkbox", "show_monthly", "Show monthly MOT", True)
-        show_segments = controls.widget("checkbox", "show_segments", "Show segment MOT", True)
+        show_monthly = controls.widget("checkbox", "show_monthly", f"Show monthly {labels['short']}", True)
+        show_segments = controls.widget("checkbox", "show_segments", f"Show segment {labels['short']}", True)
     if result.get("display_options") != (show_monthly, show_segments):
         update_otmd_display(result, show_monthly, show_segments)
     with downloads:
-        download("Download chart", result, "Type_IPD_OTMD.png", stale, "otmd_png")
-        download("Download monthly data", result, "On_time_milestone_delivery.csv", stale, "otmd_csv")
+        download("Download chart", result, labels["png"], stale, f"{metric}_png")
+        download("Download monthly data", result, labels["csv"], stale, f"{metric}_csv")
     with chart:
-        st.plotly_chart(result["chart"], theme=None, width="stretch", key="otmd_ipd",
+        st.plotly_chart(result["chart"], theme=None, width="stretch", key=f"{metric}_ipd",
                         config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
     with st.expander("Calculation"):
         st.caption(
-            "Monthly OTMD = on-time milestones ÷ total milestones completed in the month × 100. "
-            "Only milestones from the selected segments are included. Each segment uses its own milestones. "
-            "Total pools milestone counts across the selected segments; it does not average segment percentages. "
+            ("Projects On-Time uses only G5 gates, measured against the G5 target baseline fixed at G4 "
+             "in Gate date @ Baseline. Gate in Horizon identifies the gate; Gate @ baseline is accepted as a fallback. "
+             "Other gates are excluded from every series and count. "
+             if projects_only else "") +
+            f"Monthly {metric} = on-time {labels['unit']} ÷ total {labels['unit']} completed in the month × 100. "
+            f"Only {labels['unit']} from the selected segments are included. Each segment uses its own {labels['unit']}. "
+            "Total pools counts across the selected segments; it does not average segment percentages. "
             "On time means the completion date is within 31 calendar days before or after the baseline date, "
-            "inclusive. Time of day is ignored. Each row counts as one milestone. "
-            "Each line is the equally weighted mean of its monthly OTMD percentages in the current month and "
+            "inclusive. Time of day is ignored. " +
+            ("Each G5 row counts as one project. " if projects_only else "Each row counts as one milestone. ") +
+            f"Each line is the equally weighted mean of its monthly {metric} percentages in the current month and "
             "previous 11 calendar months. The first 11 calendar months of the selected history are blank; the moving average "
-            "starts in month 12 and is recalculated every month, including months without milestones. "
+            f"starts in month 12 and is recalculated every month, including months without {labels['unit']}. "
             "Start date limits the displayed month-ends; earlier history still contributes to the average. "
             "All series use the same calendar window. Rounded monthly labels show the Total moving average. "
-            "The Total line is solid and segment lines are dotted; filled dots show monthly Total OTMD. "
+            f"The Total line is solid and segment lines are dotted; filled dots show monthly Total {metric}. "
             "White-filled triangles with blue borders show monthly Total Days late on the right axis: "
             "the average of Gate date @ Baseline "
-            "minus Gate date in the period across all milestones completed that month. Negative values mean late "
+            f"minus Gate date in the period across all selected {labels['unit']} completed that month. Negative values mean late "
             "completion; positive values mean early completion. Hover lines or markers for values and counts. "
             "Empty months contribute no monthly "
-            "percentage to the average and have no dot. A 12-month window with no milestones has no average.")
-    with st.expander("Monthly KPI and milestone counts"):
+            f"percentage to the average and have no dot. A 12-month window with no {labels['unit']} has no average.")
+    with st.expander("Monthly KPI and project counts" if projects_only else "Monthly KPI and milestone counts"):
         data_table(result["displayed_values"].sort_values("Month end", ascending=False), controls, "monthly")
 
 
-def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
+def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segments=()):
     mode = result["mode"]
     controls = Controls(mode, f"results_{result['generation']}")
     planning = Controls(mode, "planning")
@@ -3137,7 +3236,7 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
     with st.container(border=True, key="results"):
         labels = ["Project planning", "Pipeline", "Time to market", "Projects", "Checks & actions"]
         if mode == "ipd":
-            labels.insert(3, OTMD_TAB)
+            labels[3:3] = ON_TIME_TABS
             labels.append("Financial metrics")
         tab_key = controls.prefix + "active_tab"
         if tab_key not in st.session_state:
@@ -3203,8 +3302,9 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
                     with st.expander("Monthly KPI and launch counts"):
                         data_table(values.drop(columns="Time to market (years)").sort_values(
                             ["Month end", "Segment"], ascending=[False, True]), controls, "monthly")
-                elif label == OTMD_TAB:
-                    show_otmd(otmd_start_date, otmd_segments)
+                elif label in ON_TIME_TABS:
+                    show_otmd(otmd_start_date, pot_segments if label == POT_TAB else otmd_segments,
+                              projects_only=label == POT_TAB)
                 elif label == "Projects":
                     data_table(result["tables"]["Projects.csv"], controls, "projects")
                     if mode == "ipd":
@@ -3227,10 +3327,11 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=()):
                                    "G1–G5 meets the cutoff. Repeated projects are consolidated across financial sections; conflicting "
                                    "values retain the first nonblank value and appear here with their source Excel row.")
                 else:
-                    st.caption("One row per project. Year 1–Year 11 follow financial headings chronologically. "
+                    st.caption("One row per project. Financial columns retain the workbook's calendar years "
+                               "or relative Year labels in chronological order. "
                                "Workbook units are retained; blank values remain empty.")
                     data_table(result["tables"]["Financial_metrics.csv"], controls, "financial")
-    if controls.values["active_tab"] == OTMD_TAB:
+    if controls.values["active_tab"] in ON_TIME_TABS:
         return
     file_slot, button_slot = st.columns([2, 1], vertical_alignment="bottom")
     with file_slot:
@@ -3271,18 +3372,19 @@ def main():
                 loaded = load_workbook(mode)
             otmd_loaded = None
             if mode == "ipd":
-                with workbook_section("otmd", "Milestone workbook (OTMD)"):
+                with workbook_section("otmd", "Milestone workbook (MOT / POT)"):
                     otmd_loaded = load_otmd_workbook()
         with sidebar, st.container(border=True, key="controls"):
             with st.container(key="workbook_header"):
                 generate_slot = st.empty()
             count_slot = st.empty()
             active_tab = active_result_tab(mode)
-            otmd_active = mode == "ipd" and active_tab == OTMD_TAB
+            otmd_active = mode == "ipd" and active_tab in ON_TIME_TABS
             otmd_milestones = otmd_loaded[3] if otmd_loaded is not None else None
             values = scope_controls(mode, loaded[2] if loaded else None, active_tab, otmd_milestones)
             otmd_start_date = values.get("start_date") if mode == "ipd" else None
             otmd_segments = otmd_segment_selection(otmd_milestones) if mode == "ipd" else ()
+            pot_segments = otmd_segment_selection(otmd_milestones, projects_only=True) if mode == "ipd" else ()
             otmd_ready = (otmd_loaded is not None and
                           (loaded is None or otmd_start_date is not None))
             options = selected = None
@@ -3315,11 +3417,11 @@ def main():
                             result["time_to_market_figure"] = time_to_market_figure(result["time_to_market_values"], mode)
                             view["result"] = result
                             view.pop("generation_error", None)
-                            # Discard old table preferences, keeping the OTMD tab when it was active.
+                            # Discard old table preferences, keeping the active on-time KPI tab.
                             view["preferences"] = {key: value for key, value in view["preferences"].items()
                                                    if not key.startswith("results_")}
-                            if active_tab == OTMD_TAB:
-                                Controls(mode, f"results_{result['generation']}").values["active_tab"] = OTMD_TAB
+                            if active_tab in ON_TIME_TABS:
+                                Controls(mode, f"results_{result['generation']}").values["active_tab"] = active_tab
                             generated = True
                         except Exception as exc:
                             view["generation_error"] = f"Unable to generate project charts: {exc}"
@@ -3332,6 +3434,16 @@ def main():
                             generated = True
                         except Exception as exc:
                             milestone_view["generation_error"] = f"Unable to generate OTMD chart: {exc}"
+                        milestone_view.pop("projects_error", None)
+                        if OTMD_GATE in otmd_milestones:
+                            try:
+                                milestone_view["projects_result"] = build_otmd_results(
+                                    *otmd_loaded, start_date=otmd_start_date, segments=pot_segments, projects_only=True)
+                                generated = True
+                            except Exception as exc:
+                                milestone_view["projects_error"] = f"Unable to generate Projects on-time chart: {exc}"
+                        else:
+                            milestone_view.pop("projects_result", None)
                 if generated:
                     st.rerun()
             for chart_view in [view, *([portfolio_state("otmd")] if mode == "ipd" else [])]:
@@ -3346,11 +3458,24 @@ def main():
                 st.warning("Settings changed. Generate charts to apply them. "
                            "Previous project results are shown; project downloads are disabled.")
             if result is not None:
-                show_results(result, stale, otmd_start_date, otmd_segments)
+                show_results(result, stale, otmd_start_date, otmd_segments, pot_segments)
             elif (mode == "ipd" and portfolio_state("otmd").get("source") is not None and
                   (view.get("source") is None or portfolio_state("otmd").get("result") is not None)):
                 with st.container(border=True, key="results"):
-                    show_otmd(otmd_start_date, otmd_segments)
+                    if portfolio_state("otmd").get("result") is None:
+                        show_otmd(otmd_start_date, otmd_segments)
+                    else:
+                        navigation = Controls("otmd", "navigation")
+                        tab_key = navigation.prefix + "active_tab"
+                        if tab_key not in st.session_state:
+                            st.session_state[tab_key] = navigation.values.get("active_tab", OTMD_TAB)
+                        tabs = st.tabs(ON_TIME_TABS, key=tab_key, on_change="rerun")
+                        navigation.values["active_tab"] = st.session_state[tab_key]
+                        for label, tab in zip(ON_TIME_TABS, tabs):
+                            if tab.open:
+                                with tab:
+                                    show_otmd(otmd_start_date, pot_segments if label == POT_TAB else otmd_segments,
+                                              projects_only=label == POT_TAB)
             else:
                 show_empty_portfolio(mode, loaded, scope_error)
     st.html('<div class="portfolio-footer">Portfolio Analysis · Type 0 &amp; IPD · Refreshing the page starts a new workspace</div>')
