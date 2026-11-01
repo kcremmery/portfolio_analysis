@@ -658,7 +658,7 @@ def type0_timeline_limits(gantt, today):
 def type0_plot_gantt(df_priority, segment, today=None, date_label="Today",
                new_projects_since=None, min_priority=TYPE0_MIN_PRIORITY, max_priority=TYPE0_MAX_PRIORITY,
                total_projects=None, total_pas=None, total_pias=None, show_today=True, prepared=None,
-               limits=None, page_label=""):
+               limits=None, page_label="", shade_years=True):
     today = pd.Timestamp(today if today is not None else date.today()).normalize()
     gantt = prepared if prepared is not None else type0_prepare_gantt_data(df_priority, today, new_projects_since)
     if gantt.empty:
@@ -723,6 +723,8 @@ def type0_plot_gantt(df_priority, segment, today=None, date_label="Today",
         visible_start = max(lower, mdates.date2num(year_start))
         visible_end = min(upper, mdates.date2num(date(year + 1, 1, 1)))
         if visible_end > visible_start:
+            if shade_years and year % 2:
+                ax.axvspan(visible_start, visible_end, facecolor="#F2F2F2", edgecolor="none", zorder=0)
             year_positions.append((visible_start + visible_end) / 2)
             year_labels.append(str(year))
     for tick in ax.get_xticklabels():
@@ -888,7 +890,8 @@ def zip_outputs(files):
 
 def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PNG_DPI,
                       new_projects_since=None, min_priority=TYPE0_MIN_PRIORITY, max_priority=TYPE0_MAX_PRIORITY,
-                      all_priorities_by_segment=None, number_counts=None, show_today=True, rows_per_page=30):
+                      all_priorities_by_segment=None, number_counts=None, show_today=True, rows_per_page=30,
+                      shade_years=True):
     """Build in-memory outputs. The UI holds a shared Matplotlib render lock.
 
     show_today controls the reporting-date line and its legend entry only.
@@ -942,7 +945,7 @@ def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PN
                                        total_projects=len(all_priorities),
                                        total_pas=all_priorities['PAS (in k EUR)'].sum(),
                                        total_pias=all_priorities['PIAS (in k EUR)'].sum(),
-                                       show_today=show_today, prepared=current, limits=limits,
+                                       show_today=show_today, shade_years=shade_years, prepared=current, limits=limits,
                                        page_label=f" · Page {page} of {page_count}" if page_count > 1 else "")
                     suffix = f"_{page}" if page_count > 1 else ""
                     segment_charts[f'Priority_Projects_{segment}{suffix}.png'] = figure_png(chart, dpi)
@@ -1559,7 +1562,7 @@ def ipd_yearly_launch_labels(projects, years, limits, reference_date=None, histo
 
 
 def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="", start_date=None,
-               reference_date=None, group_by_phase=False, historical_projects=None):
+               reference_date=None, group_by_phase=False, historical_projects=None, shade_years=True):
     """Draw a headless chart in the visual style of Type_0_Gantt.py."""
     if projects.empty:
         raise ValueError("There are no projects to plot.")
@@ -1644,6 +1647,8 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
         visible_start = max(limits[0], mdates.date2num(year_start))
         visible_end = min(limits[1], mdates.date2num(date(year + 1, 1, 1)))
         if visible_end > visible_start:
+            if shade_years and year % 2:
+                ax.axvspan(visible_start, visible_end, facecolor="#F2F2F2", edgecolor="none", zorder=0)
             year_positions.append((visible_start + visible_end) / 2)
             year_labels.append(str(year))
     positions, cursor = [], 0
@@ -2565,6 +2570,7 @@ def ipd_chart(result, page):
                 page_label=f" · Page {page} of {pages}" if pages > 1 else "",
                 start_date=settings["start_date"], reference_date=settings["reference_date"],
                 group_by_phase=settings["group_by_phase"], historical_projects=result["historical_projects"],
+                shade_years=settings.get("shade_years", True),
             )
             result["charts"][page] = figure_png(fig)
     return result["charts"][page]
@@ -2579,7 +2585,7 @@ FILTER_FIELDS = {
 
 
 def defaults(mode, data=None):
-    values = dict(minimum=None, maximum=None, show_today=True, rows=30)
+    values = dict(minimum=None, maximum=None, show_today=True, shade_years=True, rows=30)
     if mode == "type0":
         values.update(minimum=TYPE0_MIN_PRIORITY, maximum=TYPE0_MAX_PRIORITY, project_tags=["K", "C", "N"],
                       created_since=None, reporting_date=date.today().isoformat(),
@@ -2654,7 +2660,8 @@ def select_scope(mode, data, values):
                        reporting_date=parse_day(values.get("reporting_date"), "reporting date", required=True),
                        start_date=parse_day(values.get("start_date"), "start date", required=True),
                        new_since=new_since,
-                       show_today=bool(values.get("show_today")), rows_per_page=rows_per_page)
+                       show_today=bool(values.get("show_today")), shade_years=bool(values.get("shade_years", True)),
+                       rows_per_page=rows_per_page)
         return options, type0_select_web_projects(data, **selection)
     filters = {lookup[column.casefold()]: values.get(key) or []
                for key, (_, column) in FILTER_FIELDS[mode].items() if column.casefold() in lookup}
@@ -2662,7 +2669,8 @@ def select_scope(mode, data, values):
                    reference_date=date.today(), priority_column=priority_column,
                    min_priority=minimum, max_priority=maximum,
                    group_by_phase=IPD_PHASE.casefold() in lookup, order=values.get("order"),
-                   show_today=bool(values.get("show_today")), rows_per_page=rows_per_page)
+                   show_today=bool(values.get("show_today")), shade_years=bool(values.get("shade_years", True)),
+                   rows_per_page=rows_per_page)
     if options["order"] not in ("Excel order", "Start date", IPD_END_LABEL, "Activity label"):
         raise ValueError("Choose a valid project order.")
     return options, select_ipd_projects(*data, options)
@@ -2671,7 +2679,8 @@ def select_scope(mode, data, values):
 def settings_key(source, sheet, options):
     # Planning display controls update existing charts without regenerating the project selection.
     payload = [source["digest"], source["name"], sheet,
-               {key: value for key, value in options.items() if key not in {"rows_per_page", "show_today"}}]
+               {key: value for key, value in options.items()
+                if key not in {"rows_per_page", "show_today", "shade_years"}}]
     return sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -2725,17 +2734,18 @@ def planning_assets(result, mode):
     return groups, assets
 
 
-def update_planning_results(result, rows_per_page, show_today):
+def update_planning_results(result, rows_per_page, show_today, shade_years):
     """Replace Gantt pages and the ZIP while retaining the generated filter scope."""
     if rows_per_page not in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100):
         raise ValueError("Choose 10, 20, 30, 40, 50, 60, 70, 80, 90, or 100 projects per chart.")
     updated = result.copy()
     if result["mode"] == "type0":
-        updated["chart_request"] = {**result["chart_request"], "show_today": show_today}
+        updated["chart_request"] = {**result["chart_request"], "show_today": show_today, "shade_years": shade_years}
         with render_lock():
             updated.update(type0_build_web_results(**updated["chart_request"], rows_per_page=rows_per_page))
     else:
-        updated["settings"] = {**result["settings"], "rows_per_page": rows_per_page, "show_today": show_today}
+        updated["settings"] = {**result["settings"], "rows_per_page": rows_per_page,
+                               "show_today": show_today, "shade_years": shade_years}
         build_ipd_results(updated)
     groups, charts = planning_assets(updated, result["mode"])
     previous_pages = {filename for group in result["groups"] for filename in group["pages"]}
@@ -2754,6 +2764,7 @@ def build_results(mode, source, sheet, data, options, selected):
             context=type0_report_context(source, sheet, selection, options["reporting_date"], options["new_since"]),
             new_projects_since=options["new_since"], min_priority=selection["min_priority"],
             max_priority=selection["max_priority"], show_today=options["show_today"],
+            shade_years=options.get("shade_years", True),
             all_priorities_by_segment=type0_select_web_projects(data, **selection, apply_priority=False),
             number_counts=type0_count_project_numbers(data))
         with render_lock():
@@ -3065,9 +3076,6 @@ def load_otmd_workbook():
         st.error(view["upload_error"])
     source = view.get("source")
     if source is None:
-        st.caption(f"Required columns: {OTMD_ACTUAL} and {OTMD_BASELINE}. "
-                   f"Add {OTMD_SEGMENT} for segment comparisons and {OTMD_GATE} for Projects on-time. "
-                   "For G5, the baseline must be the target fixed at G4. Headings default to row 2.")
         return None
     sheet = controls.widget("selectbox", "sheet", "Milestone worksheet", source["sheets"][0],
                             options=source["sheets"])
@@ -3227,9 +3235,9 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
                                                controls.values.get("order", initial["order"]))
         controls.values["order"] = values["order"]
     values["rows"] = Controls(mode, "planning").values.get("rows", initial["rows"])
-    values["show_today"] = st.session_state.get(controls.prefix + "show_today",
-                                               controls.values.get("show_today", True))
-    controls.values["show_today"] = values["show_today"]
+    for name in ("show_today", "shade_years"):
+        values[name] = st.session_state.get(controls.prefix + name, controls.values.get(name, True))
+        controls.values[name] = values[name]
     return values
 
 
@@ -3388,9 +3396,11 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
     chart_settings = result["chart_request"] if mode == "type0" else result["settings"]
     rows_per_page = st.session_state.get(planning.prefix + "rows", planning.values.get("rows", 30))
     show_today = st.session_state.get(selection.prefix + "show_today", selection.values.get("show_today", True))
-    if rows_per_page != result.get("rows_per_page", 30) or show_today != chart_settings["show_today"]:
+    shade_years = st.session_state.get(selection.prefix + "shade_years", selection.values.get("shade_years", True))
+    if (rows_per_page != result.get("rows_per_page", 30) or show_today != chart_settings["show_today"] or
+            shade_years != chart_settings.get("shade_years", False)):
         with st.spinner("Updating chart pages and downloads…"):
-            update_planning_results(result, rows_per_page, show_today)
+            update_planning_results(result, rows_per_page, show_today, shade_years)
     show_metrics(result)
     with st.container(border=True, key="results"):
         labels = ["Project planning", "Pipeline", "Time to market", "Projects", "Checks & actions"]
@@ -3432,7 +3442,9 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                     if page:
                         st.caption(f"{group['label']} · {group['count']:,} projects · Page {page} of {len(pages)}")
                         st.image(result["assets"][filename], width="stretch")
-                    selection.widget("checkbox", "show_today", "Show today", True)
+                    with st.container(horizontal=True):
+                        selection.widget("checkbox", "show_today", "Show today", True)
+                        selection.widget("checkbox", "shade_years", "Shade alternate years", True)
                     if mode == "type0":
                         with st.expander("Segment summary"):
                             data_table(result["summary"], controls, "summary")
@@ -3548,7 +3560,7 @@ def main():
                 loaded = load_workbook(mode)
             otmd_loaded = None
             if mode == "ipd":
-                with workbook_section("otmd", "Milestone workbook (MOT / POT)"):
+                with workbook_section("otmd", "Milestone workbook"):
                     otmd_loaded = load_otmd_workbook()
         with sidebar, st.container(border=True, key="controls"):
             with st.container(key="workbook_header"):
