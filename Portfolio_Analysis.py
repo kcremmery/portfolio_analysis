@@ -2882,7 +2882,8 @@ APP_CSS = """
 .st-key-brand h1 { color:#ffffff; font-size:22px; letter-spacing:-.7px;
   display:flex; align-items:center; line-height:1.2; margin:0; padding:0; }
 .st-key-mode [role=radiogroup] { justify-content:center; }
-.st-key-mode, .st-key-data_files, .st-key-controls, .st-key-results { background:white; border-radius:14px; }
+.st-key-mode, .st-key-data_files, .st-key-controls { background:#D6EEFF; border-radius:14px; }
+.st-key-results { background:white; border-radius:14px; }
 .st-key-mode h2, .st-key-data_files h2, .st-key-controls h2 { font-size:16px; }
 .st-key-mode, .st-key-data_files { padding:8px 14px; }
 .st-key-mode h2, .st-key-data_files h2 { margin:0; padding:0; line-height:1.25; }
@@ -3347,7 +3348,6 @@ def show_otmd(start_date=None, segments=(), *, projects_only=False):
                 else f"No {labels['unit']} available for the current selection.")
         return
     downloads = st.container(horizontal=True, horizontal_alignment="right")
-    chart = st.container()
     with st.container(horizontal=True):
         show_monthly = controls.widget("checkbox", "show_monthly", f"Show monthly {labels['short']}", True)
         show_segments = controls.widget("checkbox", "show_segments", f"Show segment {labels['short']}", True)
@@ -3356,9 +3356,8 @@ def show_otmd(start_date=None, segments=(), *, projects_only=False):
     with downloads:
         download("Download chart", result, labels["png"], stale, f"{metric}_png")
         download("Download monthly data", result, labels["csv"], stale, f"{metric}_csv")
-    with chart:
-        st.plotly_chart(result["chart"], theme=None, width="stretch", key=f"{metric}_ipd",
-                        config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
+    st.plotly_chart(result["chart"], theme=None, width="stretch", key=f"{metric}_ipd",
+                    config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
     with st.expander("Calculation"):
         st.caption(
             ("Projects On-Time uses only G5 gates, measured against the G5 target baseline fixed at G4 "
@@ -3437,14 +3436,14 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                         st.space("stretch")
                         filename = group["pages"][page - 1] if page else "Unavailable.png"
                         download("Download chart", result, filename, stale, f"chart_{mode}")
+                    with st.container(horizontal=True):
+                        selection.widget("checkbox", "show_today", "Show today", True)
+                        selection.widget("checkbox", "shade_years", "Shade alternate years", True)
                     if group["message"]:
                         st.warning(group["message"])
                     if page:
                         st.caption(f"{group['label']} · {group['count']:,} projects · Page {page} of {len(pages)}")
                         st.image(result["assets"][filename], width="stretch")
-                    with st.container(horizontal=True):
-                        selection.widget("checkbox", "show_today", "Show today", True)
-                        selection.widget("checkbox", "shade_years", "Shade alternate years", True)
                     if mode == "type0":
                         with st.expander("Segment summary"):
                             data_table(result["summary"], controls, "summary")
