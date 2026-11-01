@@ -39,6 +39,7 @@ import streamlit as st
 GENERATE_BUTTON_COLOR = "#FF4B4B"  # Streamlit's default primary control colour.
 GENERATE_BUTTON_TEXT_COLOR = "#ffffff"
 CHART_BORDER_COLOR = "#B8BEC7"
+TYPE0_VALUE_LABEL_SIZE = 12  # CSS pixels; PNG labels use the equivalent 9 points.
 
 
 def add_plot_border(ax):
@@ -1374,6 +1375,25 @@ def ipd_pipeline_values(projects):
     return pd.DataFrame(records, columns=columns)
 
 
+def type0_million_label(amount, project_count=None):
+    """Format an M EUR chart value to one decimal using conventional rounding."""
+    label = ("—" if pd.isna(amount) else
+             f"{Decimal(str(amount)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP):,.1f}")
+    if project_count is not None and pd.notna(project_count):
+        label += f" (# {int(project_count)})"
+    return label
+
+
+def fixed_type0_bar_labels(figure):
+    """Keep horizontal labels centred without shrinking them to fit small stacks."""
+    figure.update_layout(uniformtext=dict(minsize=TYPE0_VALUE_LABEL_SIZE, mode="show"))
+    figure.update_traces(selector=dict(type="bar"), textposition="inside", insidetextanchor="middle",
+                         textangle=0, textfont_size=TYPE0_VALUE_LABEL_SIZE,
+                         insidetextfont=dict(color="white", size=TYPE0_VALUE_LABEL_SIZE),
+                         constraintext="none", cliponaxis=False)
+    figure.update_traces(selector=dict(type="scatter"), textfont_size=TYPE0_VALUE_LABEL_SIZE)
+
+
 def ipd_pipeline_segment_label(amount, metric, project_count=None, *, value_decimals=0):
     """Label a visible segment, adding the contributor count only for PAS."""
     if pd.isna(amount) or amount == 0:
@@ -1385,12 +1405,14 @@ def ipd_pipeline_segment_label(amount, metric, project_count=None, *, value_deci
 
 
 def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_segments=False,
-                  legend_below=False, value_fontweight="normal", title="IPD Pipeline"):
+                  legend_below=False, value_fontweight="normal", title="IPD Pipeline", millions=False):
     """Draw PAS beside PIAS for each year, stacked by market segment."""
     if values.empty:
         raise ValueError("There are no PAS/PIAS pipeline values to plot.")
     years = values["Year"].unique().tolist()
     segments = values["Segment"].unique().tolist()
+    divisor = 1000 if millions else 1
+    label_size = TYPE0_VALUE_LABEL_SIZE * 72 / 96 if millions else 8
     # Each segment has the same colour in both metrics and every year.
     segment_colours = {ipd_cell_text(segment).casefold(): colour
                        for segment, colour in (segment_colours or {}).items()}
@@ -1412,14 +1434,14 @@ def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_s
         for bar, (year, metric) in enumerate(bars):
             amount = lookup.loc[(year, metric, segment), f"Value ({IPD_PIPELINE_UNIT})"]
             valid = pd.notna(amount)
-            height = float(amount) if valid else 0.0
+            height = float(amount) / divisor if valid else 0.0
             heights.append(height)
             bottoms.append(positive[bar] if height >= 0 else negative[bar])
             if height >= 0:
                 positive[bar] += height
             else:
                 negative[bar] += height
-            totals[bar] += height
+            totals[bar] += float(amount) if valid else 0.0
             known[bar] |= valid
         ax.bar(positions, heights, width=0.35, bottom=bottoms, label=segment,
                color=segment_colours.get(ipd_cell_text(segment).casefold(), colours[index % len(colours)]),
@@ -1428,27 +1450,37 @@ def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_s
               if "Project count" in values else None)
     for (year, metric), x, top, total, valid in zip(bars, positions, positive, totals, known):
         label = f"{total:,.{value_decimals}f}" if valid else "—"
-        if value_decimals:
+        if millions:
+            label = type0_million_label(total / divisor) if valid else "—"
+        elif value_decimals:
             label = label.rstrip("0").rstrip(".")
         if metric == "PAS" and counts is not None:
             label += f" (# {int(counts.loc[(year, metric)])})"
         ax.annotate(label, (x, top), xytext=(0, 6), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=8, color="black", fontweight=value_fontweight)
+                    ha="center", va="bottom", fontsize=label_size, color="black", fontweight=value_fontweight)
     if label_segments:
         for segment, container in zip(segments, ax.containers):
-            labels = [ipd_pipeline_segment_label(
-                bar.get_height(), metric,
-                lookup.loc[(year, metric, segment), "Project count"] if "Project count" in lookup else None,
-                value_decimals=value_decimals) for bar, (year, metric) in zip(container, bars)]
-            ax.bar_label(container, labels=labels, label_type="center", fontsize=8, color="white",
+            labels = []
+            for bar, (year, metric) in zip(container, bars):
+                count = (lookup.loc[(year, metric, segment), "Project count"]
+                         if "Project count" in lookup else None)
+                if millions:
+                    # Label source values: rectangle geometry may lose precision at half-decimal boundaries.
+                    amount = lookup.loc[(year, metric, segment), f"Value ({IPD_PIPELINE_UNIT})"]
+                    labels.append(type0_million_label(float(amount) / divisor, count if metric == "PAS" else None)
+                                  if pd.notna(amount) and amount != 0 else "")
+                else:
+                    labels.append(ipd_pipeline_segment_label(bar.get_height(), metric, count,
+                                                             value_decimals=value_decimals))
+            ax.bar_label(container, labels=labels, label_type="center", fontsize=label_size, color="white",
                          fontweight=value_fontweight)
     ax.set_xticks(positions, [metric for _, metric in bars], fontsize=8, color=GREY)
     for index, year in enumerate(years):
         ax.text(index, -0.09, year, transform=ax.get_xaxis_transform(), ha="center",
                 va="top", fontsize=10, color=GREY, fontweight="bold")
     ax.set_xlabel("Year", labelpad=38, color=GREY)
-    ax.set_ylabel(f"Value ({IPD_PIPELINE_UNIT})", color=GREY)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
+    ax.set_ylabel(f"Value ({'M EUR' if millions else IPD_PIPELINE_UNIT})", color=GREY)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.1f}" if millions else f"{value:,.0f}"))
     ax.tick_params(axis="both", length=0, colors=GREY)
     ax.set_axisbelow(True)
     ax.grid(axis="both", which="major", color="#E8EBEF", linewidth=0.8, zorder=0)
@@ -2149,9 +2181,124 @@ def build_pipeline_results(projects, mode, start_date=None):
         with render_lock():
             fig = ipd_plot_pipeline(values, title=f"{mode} Pipeline", value_decimals=0,
                                     label_segments=True, legend_below=True,
-                                    value_fontweight="normal", segment_colours=SEGMENT_COLOURS)
+                                    value_fontweight="normal", segment_colours=SEGMENT_COLOURS,
+                                    millions=mode == "Type 0")
             png = figure_png(fig, dpi=180)
     return dict(pipeline_values=values, pipeline_png=png)
+
+
+def type0_capex_values(projects):
+    """Sum positive CAPEX and count its projects by Latest Due Date month."""
+    columns = ["Month", "Segment", "CAPEX (in k EUR)", "Project count"]
+    amounts = projects["CAPEX (in k EUR)"].map(type0_numeric_value)
+    dates = type0_convert_to_date(projects["Latest Due Date"], warn_invalid=False)
+    eligible = amounts.gt(0) & dates.notna()
+    if not eligible.any():
+        return pd.DataFrame(columns=columns)
+    segments = projects["Segment"].map(type0_cell_text).replace("", "(Blank)")
+    contributions = pd.DataFrame({
+        "Month": dates.loc[eligible].dt.to_period("M").dt.to_timestamp(),
+        "Segment": segments.loc[eligible], "CAPEX (in k EUR)": amounts.loc[eligible],
+    })
+    values = contributions.groupby(["Month", "Segment"]).agg(
+        **{"CAPEX (in k EUR)": ("CAPEX (in k EUR)", "sum"),
+           "Project count": ("CAPEX (in k EUR)", "size")})
+    months = pd.date_range(contributions["Month"].min(), contributions["Month"].max(), freq="MS")
+    index = pd.MultiIndex.from_product(
+        [months, sorted(segments.unique(), key=str.casefold)], names=["Month", "Segment"])
+    return values.reindex(index, fill_value=0).reset_index()[columns]
+
+
+def capex_figure(values):
+    """Monthly CAPEX stacks and totals use the same colours as the pipeline."""
+    figure = go.Figure()
+    if values.empty:
+        figure.add_annotation(text="No positive CAPEX with valid Latest Due Dates in this selection.",
+                              x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+    else:
+        fallback = ["#52B788", "#9B72CF", "#36A6A6", "#E76F51"]
+        for index, segment in enumerate(values["Segment"].unique()):
+            rows = values.loc[values["Segment"].eq(segment)].sort_values("Month")
+            figure.add_bar(
+                name=segment, x=rows["Month"].dt.strftime("%b %Y").tolist(),
+                y=(rows["CAPEX (in k EUR)"] / 1000).tolist(),
+                marker_color=SEGMENT_COLOURS.get(segment, fallback[index % len(fallback)]),
+                text=[type0_million_label(amount / 1000, count) if amount > 0 else ""
+                      for amount, count in zip(rows["CAPEX (in k EUR)"], rows["Project count"])],
+                textposition="inside", insidetextanchor="middle", insidetextfont=dict(color="white"),
+                customdata=rows["Project count"].tolist(),
+                hovertemplate=("%{fullData.name} · %{x}<br>CAPEX: %{y:,.1f} M EUR"
+                               "<br>Projects: %{customdata}<extra></extra>"))
+        totals = values.groupby("Month", sort=True)[["CAPEX (in k EUR)", "Project count"]].sum()
+        figure.add_scatter(
+            x=totals.index.strftime("%b %Y").tolist(), y=(totals["CAPEX (in k EUR)"] / 1000).tolist(),
+            text=[type0_million_label(amount / 1000, count) for amount, count in
+                  zip(totals["CAPEX (in k EUR)"], totals["Project count"])],
+            mode="text", textposition="top center", textfont=dict(color="black"),
+            showlegend=False, hoverinfo="skip", cliponaxis=False)
+        figure.update_yaxes(range=[0, float(totals["CAPEX (in k EUR)"].max()) / 1000 * 1.18])
+    figure.update_layout(
+        template="plotly_white", title="CAPEX requirements", title_font=dict(weight="bold"),
+        barmode="stack", height=530, margin=dict(l=60, r=25, t=70, b=115),
+        font=dict(family="Arial, sans-serif", color="#35445a"),
+        yaxis_title="CAPEX (M EUR)", xaxis_title="Latest Due Date month",
+        legend=dict(orientation="h", y=-0.32, x=0), hoverlabel=dict(bgcolor="white"),
+        paper_bgcolor="white", plot_bgcolor="white", uirevision="capex")
+    figure.update_xaxes(type="category", tickangle=-45, showgrid=True,
+                        gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    figure.update_yaxes(tickformat=",.1f", rangemode="tozero", showgrid=True,
+                        gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    fixed_type0_bar_labels(figure)
+    return figure
+
+
+def capex_png(chart):
+    """Export the chart's exact monthly series, counts, labels and colours."""
+    with render_lock():
+        months = list(chart.data[0].x)
+        figure = Figure(figsize=(max(12, len(months) * 0.85), 6), facecolor="white")
+        FigureCanvasAgg(figure)
+        ax = figure.subplots()
+        positions = np.arange(len(months))
+        bottoms = np.zeros(len(months))
+        label_size = TYPE0_VALUE_LABEL_SIZE * 72 / 96
+        for trace in chart.data:
+            if trace.type == "bar":
+                bars = ax.bar(positions, trace.y, bottom=bottoms, width=0.65, label=trace.name,
+                              color=trace.marker.color, edgecolor="white", linewidth=0.5)
+                ax.bar_label(bars, labels=trace.text, label_type="center", fontsize=label_size, color="white")
+                bottoms += np.asarray(trace.y, dtype=float)
+            else:
+                for x, y, label in zip(positions, trace.y, trace.text):
+                    ax.annotate(label, (x, y), xytext=(0, 6), textcoords="offset points",
+                                ha="center", va="bottom", fontsize=label_size, color="black")
+        ax.set_xticks(positions, months, rotation=45, ha="right")
+        ax.set_ylim(*chart.layout.yaxis.range)
+        ax.set_title(chart.layout.title.text, loc="left", pad=20, color="#35445a", fontweight="bold")
+        ax.set_xlabel(chart.layout.xaxis.title.text, labelpad=12, color="#35445a")
+        ax.set_ylabel(chart.layout.yaxis.title.text, color="#35445a")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.1f}"))
+        ax.tick_params(axis="both", length=0, colors="#35445a", labelsize=9)
+        ax.set_axisbelow(True)
+        ax.grid(axis="both", color="#E8EBEF", linewidth=0.8)
+        add_plot_border(ax)
+        handles, labels = ax.get_legend_handles_labels()
+        figure.legend(handles, labels, loc="lower left", bbox_to_anchor=(0.06, 0.01),
+                      ncol=min(5, len(handles)), frameon=False, fontsize=9)
+        figure.tight_layout(rect=(0, 0.08, 1, 1))
+        return figure_png(figure, dpi=180)
+
+
+def build_capex_results(projects):
+    values = type0_capex_values(projects)
+    chart = capex_figure(values)
+    missing_dates = (projects["CAPEX (in k EUR)"].map(type0_numeric_value).gt(0) &
+                     type0_convert_to_date(projects["Latest Due Date"], warn_invalid=False).isna())
+    return dict(capex_values=values, capex_figure=chart,
+                capex_png=capex_png(chart) if not values.empty else None,
+                capex_missing_dates=int(missing_dates.sum()))
 
 
 def build_time_to_market_results(projects, mode, today=None, start_date=None):
@@ -2614,12 +2761,13 @@ def build_results(mode, source, sheet, data, options, selected):
         result["chart_request"] = chart_request
         projects = pd.concat(selected.values(), ignore_index=True)
         result.update(build_pipeline_results(projects, "Type 0", start_date=options["start_date"]))
+        result.update(build_capex_results(projects))
         projects = projects[[col for col in projects if not col.startswith((".raw_date_", ".raw_numeric_"))]].copy()
         for column in projects.select_dtypes(include=["object", "string"]):
             projects[column] = projects[column].map(type0_cell_text)
         result["projects"] = projects
         tables = {"Projects.csv": projects, "Segment_summary.csv": result["summary"],
-                  "Checks_and_actions.csv": result["issues"]}
+                  "Checks_and_actions.csv": result["issues"], "CAPEX.csv": result["capex_values"]}
         result["missing_dates"] = int(projects["Due Date"].isna().sum())
     else:
         # The original renderer also supplies phase grouping and historical launch totals.
@@ -2633,6 +2781,8 @@ def build_results(mode, source, sheet, data, options, selected):
                   "Financial_metrics.csv": projects[[IPD_PROJECT, IPD_DESCRIPTION, *financial_columns]]}
         result["missing_dates"] = int(projects["End"].isna().sum())
     groups, assets = planning_assets(result, mode)
+    if mode == "type0" and result["capex_png"] is not None:
+        assets["Type_0_CAPEX.png"] = result["capex_png"]
     pipeline_name = "Type_0_Pipeline.png" if mode == "type0" else "Type_IPD_Pipeline.png"
     if result["pipeline_png"] is not None:
         assets[pipeline_name] = result["pipeline_png"]
@@ -2652,6 +2802,8 @@ def build_results(mode, source, sheet, data, options, selected):
 def pipeline_figure(values, mode):
     """Interactive counterpart of the shared, exportable pipeline PNG."""
     figure = go.Figure()
+    millions = mode == "type0"
+    divisor = 1000 if millions else 1
     if values.empty:
         figure.add_annotation(text="No numeric PAS/PIAS values with valid dates in this selection.",
                               x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
@@ -2661,39 +2813,46 @@ def pipeline_figure(values, mode):
         fallback = ["#52B788", "#9B72CF", "#36A6A6", "#E76F51"]
         for index, segment in enumerate(values["Segment"].unique()):
             rows = values.loc[values["Segment"].eq(segment)].set_index(["Year", "Metric"])
-            y = [None if pd.isna(rows.loc[pair, "Value (k EUR)"]) else float(rows.loc[pair, "Value (k EUR)"])
+            y = [None if pd.isna(rows.loc[pair, "Value (k EUR)"]) else float(rows.loc[pair, "Value (k EUR)"]) / divisor
                  for pair in pairs]
+            labels = []
+            for value, pair in zip(y, pairs):
+                count = rows.loc[pair, "Project count"] if "Project count" in rows else None
+                labels.append((type0_million_label(value, count if pair[1] == "PAS" else None)
+                               if value is not None and value != 0 else "") if millions else
+                              ipd_pipeline_segment_label(value, pair[1], count))
             figure.add_bar(name=segment, x=x, y=y, marker_color=SEGMENT_COLOURS.get(segment, fallback[index % len(fallback)]),
-                           text=[ipd_pipeline_segment_label(
-                               value, pair[1], rows.loc[pair, "Project count"] if "Project count" in rows else None)
-                               for value, pair in zip(y, pairs)], textposition="inside",
+                           text=labels, textposition="inside",
                            insidetextfont=dict(color="white"),
                            customdata=[[str(year), metric, segment] for year, metric in pairs],
-                           hovertemplate="%{customdata[2]} · %{customdata[0]} %{customdata[1]}<br>%{y:,.0f} k EUR<extra></extra>")
+                           hovertemplate=("%{customdata[2]} · %{customdata[0]} %{customdata[1]}<br>" +
+                                          ("%{y:,.1f} M EUR" if millions else "%{y:,.0f} k EUR") + "<extra></extra>"))
         totals, tops = [], []
         for year, metric in pairs:
             rows = values.loc[values["Year"].eq(year) & values["Metric"].eq(metric)]
             numbers = rows["Value (k EUR)"]
-            total = numbers.sum(min_count=1)
-            label = "—" if pd.isna(total) else f"{total:,.0f}"
+            total = numbers.sum(min_count=1) / divisor
+            label = type0_million_label(total) if millions else ("—" if pd.isna(total) else f"{total:,.0f}")
             if metric == "PAS" and "Project count" in rows:
                 label += f" (# {int(rows['Project count'].sum())})"
             totals.append(label)
-            tops.append(float(numbers.clip(lower=0).sum()))
+            tops.append(float(numbers.clip(lower=0).sum()) / divisor)
         figure.add_scatter(x=x, y=tops, text=totals, mode="text", textposition="top center",
                            textfont=dict(color="black"), showlegend=False, hoverinfo="skip", cliponaxis=False)
     figure.update_layout(template="plotly_white", title=f"{MODES[mode]} pipeline",
                          title_font=dict(weight="bold"), barmode="relative",
                          height=530, margin=dict(l=60, r=25, t=70, b=100), font=dict(family="Arial, sans-serif", color="#35445a"),
-                         yaxis_title="Value (k EUR)", legend=dict(orientation="h", y=-0.22, x=0),
+                         yaxis_title=f"Value ({'M EUR' if millions else 'k EUR'})", legend=dict(orientation="h", y=-0.22, x=0),
                          hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", plot_bgcolor="white",
                          uirevision="pipeline")
     figure.update_xaxes(type="multicategory", title=None, tickson="labels", showgrid=True,
                         gridcolor="#E8EBEF", gridwidth=1,
                         showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
-    figure.update_yaxes(tickformat=",.0f", rangemode="tozero", showgrid=True,
+    figure.update_yaxes(tickformat=",.1f" if millions else ",.0f", rangemode="tozero", showgrid=True,
                         gridcolor="#E8EBEF", gridwidth=1,
                         showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    if millions:
+        fixed_type0_bar_labels(figure)
     return figure
 
 
@@ -3055,7 +3214,7 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
             day("new_since", "Mark new projects created since",
                 "N includes and labels projects created on or after this date. Clear to disable N.")
         values["reporting_date"] = controls.values.get("reporting_date", initial["reporting_date"])
-        if active_tab not in {"Pipeline", "Time to market"}:
+        if active_tab not in {"Pipeline", "CAPEX", "Time to market"}:
             day("reporting_date", "Reporting date")
     else:
         multiselect("phases")
@@ -3235,7 +3394,9 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
     show_metrics(result)
     with st.container(border=True, key="results"):
         labels = ["Project planning", "Pipeline", "Time to market", "Projects", "Checks & actions"]
-        if mode == "ipd":
+        if mode == "type0":
+            labels.insert(2, "CAPEX")
+        else:
             labels[3:3] = ON_TIME_TABS
             labels.append("Financial metrics")
         tab_key = controls.prefix + "active_tab"
@@ -3280,6 +3441,21 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                         download("Download chart", result, result["pipeline_name"], stale, f"pipeline_png_{mode}")
                     st.plotly_chart(result["pipeline_figure"], theme=None, width="stretch", key=f"pipeline_{mode}",
                                      config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
+                elif label == "CAPEX":
+                    if "capex_values" not in result:
+                        st.info("Select Generate charts to add CAPEX requirements to these results.")
+                        continue
+                    with st.container(horizontal=True, horizontal_alignment="right"):
+                        download("Download chart", result, "Type_0_CAPEX.png", stale, "capex_png_type0")
+                    st.plotly_chart(result["capex_figure"], theme=None, width="stretch", key="capex_type0",
+                                    config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
+                    st.caption("CAPEX in M EUR by Latest Due Date month for the filtered projects. "
+                               "Labels show CAPEX and (# project count); only positive CAPEX is included.")
+                    if result["capex_missing_dates"]:
+                        st.caption(f"{result['capex_missing_dates']:,} project(s) with positive CAPEX excluded "
+                                   "because their Latest Due Date is missing or invalid.")
+                    with st.expander("Monthly CAPEX and project counts"):
+                        data_table(result["capex_values"], controls, "capex")
                 elif label == "Time to market":
                     values = result["time_to_market_values"]
                     actual = values.loc[values["Period"].eq("Actual")]
