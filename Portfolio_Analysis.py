@@ -346,12 +346,6 @@ def type0_check_priority_projects(df_priority, segment, today=None, number_count
         if pd.notna(pas) and pd.notna(pias):
             if pias > pas:
                 add_error("PIAS cannot be larger than PAS")
-            elif pias == pas:
-                add_error(
-                    f"PAS = PIAS ({type0_format_value(pas)} k EUR): "
-                    "are all projected sales incremental?",
-                    action_recipient=product_manager,
-                )
         # Control 3: no due date before Creation Date.
         creation, due = row["Creation Date"], row["Due Date"]
         if pd.notna(creation) and any(
@@ -3253,7 +3247,7 @@ def download(label, result, filename, stale, key, **kwargs):
                        **kwargs)
 
 
-def data_table(frame, controls, name):
+def data_table(frame, controls, name, *, paginate=True):
     """View-only search and multi-column sorting never alter generated exports."""
     if frame.empty:
         st.caption("No rows in this selection.")
@@ -3278,12 +3272,15 @@ def data_table(frame, controls, name):
         except TypeError:
             filtered = filtered.sort_values(sort, ascending=not descending, kind="stable",
                                              key=lambda column: column.astype("string"), na_position="last")
-    pages = max(1, math.ceil(len(filtered) / 15))
-    page = controls.widget("selectbox", f"{name}_page", "Table page", 1,
-                            options=list(range(1, pages + 1)), format_func=lambda value: f"{value} of {pages}",
-                            width=150)
+    if paginate:
+        pages = max(1, math.ceil(len(filtered) / 15))
+        page = controls.widget("selectbox", f"{name}_page", "Table page", 1,
+                                options=list(range(1, pages + 1)), format_func=lambda value: f"{value} of {pages}",
+                                width=150)
+        visible = filtered.iloc[(page - 1) * 15:page * 15].copy()
+    else:
+        visible = filtered.copy()
     st.caption(f"{len(filtered):,} of {len(frame):,} rows · exports include the full generated selection.")
-    visible = filtered.iloc[(page - 1) * 15:page * 15].copy()
     # Mixed Excel types otherwise trigger Arrow conversion errors in dataframe display.
     for column in visible.select_dtypes(include=["object", "string"]):
         visible[column] = visible[column].map(type0_cell_text)
@@ -3493,10 +3490,12 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                     show_otmd(otmd_start_date, pot_segments if label == POT_TAB else otmd_segments,
                               projects_only=label == POT_TAB)
                 elif label == "Projects":
-                    data_table(result["tables"]["Projects.csv"], controls, "projects")
                     if mode == "ipd":
-                        st.subheader("Milestones")
-                        data_table(result["milestones"], controls, "milestones")
+                        st.markdown("#### Projects")
+                    data_table(result["tables"]["Projects.csv"], controls, "projects", paginate=False)
+                    if mode == "ipd":
+                        st.markdown("#### Milestones")
+                        data_table(result["milestones"], controls, "milestones", paginate=False)
                 elif label == "Checks & actions":
                     st.caption(f"{len(result['issues']):,} checks & actions")
                     if result["issues"].empty:
@@ -3520,12 +3519,10 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                     data_table(result["tables"]["Financial_metrics.csv"], controls, "financial")
     if controls.values["active_tab"] in ON_TIME_TABS:
         return
-    file_slot, button_slot = st.columns([2, 1], vertical_alignment="bottom")
-    with file_slot:
+    with st.container(horizontal=True, wrap=False, vertical_alignment="bottom", gap="small"):
         files = [filename for filename in result["assets"] if not filename.endswith(".png")]
         filename = controls.widget("selectbox", "export", "Export a table or report", files[0], options=files,
-                                    format_func=lambda value: value.replace("_", " "))
-    with button_slot:
+                                    format_func=lambda value: value.replace("_", " "), width=400)
         download("Download file", result, filename, stale, f"file_{mode}")
 
 
