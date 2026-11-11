@@ -12,6 +12,7 @@ from base64 import b64encode
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from hashlib import sha256
+from html import escape, unescape
 from io import BytesIO
 import json
 import math
@@ -35,10 +36,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-# Generate charts button colours. Set these to CSS colours, for example "#16803c".
-GENERATE_BUTTON_COLOR = "#FF4B4B"  # Streamlit's default primary control colour.
-GENERATE_BUTTON_TEXT_COLOR = "#ffffff"
 CHART_BORDER_COLOR = "#B8BEC7"
+PROJECT_DOT_LINESTYLE = (0, (0.01, 2))  # Near-zero strokes with round caps render as circular dots.
 TYPE0_VALUE_LABEL_SIZE = 12  # CSS pixels; PNG labels use the equivalent 9 points.
 
 
@@ -82,6 +81,7 @@ TYPE0_NUMERIC_CHECK_FIELDS = ("PAS (in k EUR)", "PIAS (in k EUR)", "CAPEX (in k 
 TYPE0_K_EUR_MISSING_TOKENS = ("", "-", "nc", "na", "n/a")
 TYPE0_ERROR_COLUMNS = ("Recipient", "Product_Manager", "Project_Manager", "Number", "Project_Name", "Action")
 TYPE0_STATUS_COLOURS = {"On track": "#52DEAD", "At risk": "#FAA64A", "Overdue": "#FA6157"}
+TYPE0_COMPLETED_FILL = "#DCF8EF"
 TYPE0_MISSING_DATA_LABEL = "missing and invalid data"
 GREY = "#5E5E5E"
 TODAY_COLOUR = "#3066E3"
@@ -499,6 +499,8 @@ def type0_prepare_gantt_data(df_priority, today=None, new_projects_since=None):
     gantt = df_priority.copy().reset_index(drop=True)
     # Keep every selected project, including rows without a drawable timeline.
     gantt["Has_Valid_Dates"] = gantt["Creation Date"].notna() & gantt["Due Date"].notna()
+    gantt["Is_Completed"] = gantt["Status"].map(type0_cell_text).str.casefold().eq("completed")
+    gantt["Completed_Latest_Due_Date"] = gantt["Latest Due Date"].where(gantt["Is_Completed"])
     gantt["Top3_PIAS"] = type0_identify_top3_pias(gantt)
     gantt["Activity_Parts"] = [type0_create_activity_label(row, row["Top3_PIAS"]) for _, row in gantt.iterrows()]
     gantt["Activity"] = gantt["Activity_Parts"].map(lambda parts: "".join(t for t, _ in parts))
@@ -584,6 +586,7 @@ def type0_project_label_width_pt(row, renderer, dpi):
 def type0_add_project_labels(ax, row, renderer):
     # Keep progress closest to the start marker, with indicators in their own badge.
     labels = [row["Project_Label"], row["Progress_Label"]]
+    fill_colour = TYPE0_COMPLETED_FILL if row["Is_Completed"] else "white"
     font_size, padding, gap, offset = 8.5, 1.5, 3.0, 5.7
     font = FontProperties(family="DejaVu Sans", size=font_size)
     for label in reversed([value for value in labels if value]):
@@ -594,20 +597,26 @@ def type0_add_project_labels(ax, row, renderer):
             xytext=(-offset - padding, 0), textcoords="offset points",
             ha="right", va="center", fontsize=font_size, color=GREY,
             fontfamily="DejaVu Sans", parse_math=False,
-            bbox={"boxstyle": f"round,pad={padding / font_size}", "facecolor": "white", "edgecolor": GREY, "linewidth": 0.8},
+            bbox={"boxstyle": f"round,pad={padding / font_size}", "facecolor": fill_colour, "edgecolor": GREY, "linewidth": 0.8},
             annotation_clip=False, zorder=6,
         )
         offset += width_pt + 2 * padding + gap
 
 
-def type0_legend_item(text, colour=GREY, symbol="line"):
+def type0_legend_item(text, colour=GREY, symbol="line", fill_colour="white"):
     drawing = DrawingArea(20, 11, 0, 0)
     if symbol == "triangle":
         line = Line2D([10], [5.5], linestyle="none", marker="^", markersize=7,
-                      markerfacecolor="white", markeredgecolor=colour, markeredgewidth=0.8)
+                      markerfacecolor=fill_colour, markeredgecolor=colour, markeredgewidth=0.8)
+    elif symbol == "circle":
+        line = Line2D([10], [5.5], linestyle="none", marker="o", markersize=7,
+                      markerfacecolor=fill_colour, markeredgecolor=colour, markeredgewidth=1.3)
     elif symbol == "cross":
         line = Line2D([10], [5.5], linestyle="none", marker="x", markersize=5,
                       markeredgecolor=colour, markeredgewidth=0.8)
+    elif symbol == "dotted_line":
+        line = Line2D([0, 20], [5.5, 5.5], color=colour, linewidth=2,
+                      linestyle=PROJECT_DOT_LINESTYLE, dash_capstyle="round")
     else:
         line = Line2D([0, 20], [5.5, 5.5], color=colour,
                       linewidth=2 if symbol == "line" else 0.8,
@@ -616,15 +625,23 @@ def type0_legend_item(text, colour=GREY, symbol="line"):
     return HPacker(children=[drawing, type0_text_area(text)], align="center", pad=0, sep=4)
 
 
-def type0_add_two_line_legend(fig, y, today, date_label="Today", show_today=True):
+def type0_add_two_line_legend(fig, y, today, date_label="Today", show_today=True, show_completed_date=False):
     first = HPacker(children=[
         type0_text_area("S = PAS   |   I = PIAS   |   P = Priority   |   K = Key project   |   C = CAPEX   |   N = New project   |   Status"),
         *[type0_legend_item(name, colour) for name, colour in TYPE0_STATUS_COLOURS.items()],
+        type0_legend_item("Completed", colour=TYPE0_STATUS_COLOURS["On track"], symbol="dotted_line"),
     ], align="center", pad=0, sep=10)
     date_items = [
+        type0_legend_item("In Progress", colour=TYPE0_STATUS_COLOURS["On track"], symbol="circle"),
+        type0_legend_item("Not in progress", colour=TYPE0_STATUS_COLOURS["At risk"], symbol="circle"),
         type0_legend_item("Original due date", symbol="triangle"),
         type0_legend_item("Due date", symbol="cross"),
     ]
+    if show_completed_date:
+        date_items.append(type0_legend_item(
+            "Latest due date (Completed)", colour=TYPE0_STATUS_COLOURS["On track"],
+            symbol="triangle", fill_colour=TYPE0_COMPLETED_FILL,
+        ))
     if show_today:
         date_items.append(type0_legend_item(f"{date_label} ({type0_english_date(today)})", colour=TODAY_COLOUR, symbol="today"))
     second = HPacker(children=date_items, align="center", pad=0, sep=16)
@@ -640,6 +657,7 @@ def type0_timeline_limits(gantt, today):
     dates = [today]
     for field in ("Creation Date", "Due Date", "Original Due Date"):
         dates.extend(timelines[field].dropna().tolist())
+    dates.extend(gantt["Completed_Latest_Due_Date"].dropna().tolist())
     dates.extend(type0_create_due_date_tracking_data(gantt)["Tracking_Date"].tolist())
     if timelines.empty:
         dates.extend([today - pd.Timedelta(days=30), today + pd.Timedelta(days=30)])
@@ -747,6 +765,12 @@ def type0_plot_gantt(df_priority, segment, today=None, date_label="Today",
             frameon=False, annotation_clip=False,
         )
         ax.add_artist(label)
+        completed_date = row["Completed_Latest_Due_Date"]
+        if pd.notna(completed_date):
+            ax.plot(completed_date, y, marker="^", markersize=8,
+                    markerfacecolor=TYPE0_COMPLETED_FILL,
+                    markeredgecolor=TYPE0_STATUS_COLOURS["On track"], markeredgewidth=0.8,
+                    linestyle="none", zorder=7)
         if not row["Has_Valid_Dates"]:
             ax.text(
                 0.02, y, TYPE0_MISSING_DATA_LABEL, transform=ax.get_yaxis_transform(),
@@ -757,11 +781,14 @@ def type0_plot_gantt(df_priority, segment, today=None, date_label="Today",
                 zorder=6,
             )
             continue
-        colour = TYPE0_STATUS_COLOURS[row["Timeline_Status"]]
+        completed = row["Is_Completed"]
+        colour = TYPE0_STATUS_COLOURS["On track" if completed else row["Timeline_Status"]]
         ax.plot([row["Creation Date"], row["Due Date"]], [y, y], color=colour,
-                linewidth=3.0, solid_capstyle="round", zorder=2)
-        start_colour = TYPE0_STATUS_COLOURS["On track"] if row["Status"] == "In Progress" else TYPE0_STATUS_COLOURS["At risk"]
-        ax.plot(row["Creation Date"], y, marker="o", markersize=7, markerfacecolor="white",
+                linewidth=3.0, linestyle=PROJECT_DOT_LINESTYLE if completed else "-",
+                solid_capstyle="round", dash_capstyle="round", zorder=2)
+        start_colour = TYPE0_STATUS_COLOURS["On track"] if completed or row["Status"] == "In Progress" else TYPE0_STATUS_COLOURS["At risk"]
+        ax.plot(row["Creation Date"], y, marker="o", markersize=7,
+                markerfacecolor=TYPE0_COMPLETED_FILL if completed else "white",
                 markeredgecolor=start_colour, markeredgewidth=1.3, linestyle="none", zorder=4)
         original = row["Original Due Date"]
         if pd.notna(original):
@@ -801,7 +828,10 @@ def type0_plot_gantt(df_priority, segment, today=None, date_label="Today",
              f"Type 0 Projects {segment} [Priority: {type0_priority_range_label(min_priority, max_priority)}]{page_label}",
              fontsize=14, fontweight="bold", va="top", color="#222222")
     fig.text(20 / width_pt, subtitle_y, subtitle, fontsize=10, va="top", color=GREY)
-    type0_add_two_line_legend(fig, plot_bottom - 68 / height_pt, today, date_label, show_today=show_today)
+    type0_add_two_line_legend(
+        fig, plot_bottom - 68 / height_pt, today, date_label, show_today=show_today,
+        show_completed_date=gantt["Completed_Latest_Due_Date"].notna().any(),
+    )
     return fig
 
 
@@ -885,7 +915,7 @@ def zip_outputs(files):
 def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PNG_DPI,
                       new_projects_since=None, min_priority=TYPE0_MIN_PRIORITY, max_priority=TYPE0_MAX_PRIORITY,
                       all_priorities_by_segment=None, number_counts=None, show_today=True, rows_per_page=30,
-                      shade_years=True):
+                      shade_years=True, render_charts=True):
     """Build in-memory outputs. The UI holds a shared Matplotlib render lock.
 
     show_today controls the reporting-date line and its legend entry only.
@@ -904,7 +934,7 @@ def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PN
                 "All": pd.concat(all_priorities_by_segment.values(), ignore_index=True),
                 **all_priorities_by_segment,
             }
-    charts, chart_pages, messages, summaries = {}, {}, {}, []
+    charts, chart_jobs, chart_pages, messages, summaries = {}, {}, {}, {}, []
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always', UserWarning)
         for segment, selected in chart_projects.items():
@@ -933,7 +963,7 @@ def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PN
                     start = (page - 1) * rows_per_page
                     current = gantt.iloc[start:start + rows_per_page].copy()
                     current["Y_Position"] = np.arange(len(current))
-                    chart = type0_plot_gantt(selected.iloc[start:start + rows_per_page], segment, today,
+                    job = dict(df_priority=selected.iloc[start:start + rows_per_page], segment=segment, today=today,
                                        date_label='As of', new_projects_since=new_projects_since,
                                        min_priority=min_priority, max_priority=max_priority,
                                        total_projects=len(all_priorities),
@@ -942,9 +972,12 @@ def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PN
                                        show_today=show_today, shade_years=shade_years, prepared=current, limits=limits,
                                        page_label=f" · Page {page} of {page_count}" if page_count > 1 else "")
                     suffix = f"_{page}" if page_count > 1 else ""
-                    segment_charts[f'Priority_Projects_{segment}{suffix}.png'] = figure_png(chart, dpi)
+                    filename = f'Priority_Projects_{segment}{suffix}.png'
+                    chart_jobs[filename] = job
+                    if render_charts:
+                        segment_charts[filename] = figure_png(type0_plot_gantt(**job), dpi)
+                    chart_pages[segment].append(filename)
                 charts.update(segment_charts)
-                chart_pages[segment] = list(segment_charts)
                 missing_dates = int((~gantt['Has_Valid_Dates']).sum())
                 if missing_dates:
                     messages[segment] = (
@@ -962,7 +995,7 @@ def type0_build_web_results(projects_by_segment, today, context=(), dpi=TYPE0_PN
     issues = pd.concat(issue_tables, ignore_index=True) if issue_tables else pd.DataFrame()
     return {
         'charts': charts, 'chart_pages': chart_pages, 'messages': messages, 'summary': pd.DataFrame(summaries),
-        'issues': issues, 'report': report, 'warnings': notes,
+        'issues': issues, 'report': report, 'warnings': notes, 'chart_jobs': chart_jobs, 'chart_dpi': dpi,
     }
 
 
@@ -976,6 +1009,10 @@ IPD_END_LABEL = "Launch date"
 IPD_PHASE = "Current phase Project"
 IPD_PHASE_ORDER = ("Scoping", "Opportunity Assessment", "Design", "Industrialize",
                "Launch Preparation", "Post Launch")
+IPD_CURRENT_GATE = "Current gate (Desc) Project"
+IPD_STAGE_COLOURS = dict(zip(IPD_PHASE_ORDER,
+                           ("#FA6157", "#FAA64A", "#D645CC", "#3066E3", "#32AAFF", "#52DEAD")))
+IPD_UNKNOWN_STAGE = "Unknown stage"
 IPD_PHASE_ALIASES = {"opportunity assessment / desing": "Opportunity Assessment",
                  "opportunity assessment / design": "Opportunity Assessment",
                  "develop / industrialize": "Industrialize"}
@@ -989,6 +1026,7 @@ IPD_IMPORT_VERSION = 2  # Preserve source years and accept variable financial ho
 IPD_FINANCIAL_METRICS = ("PAC", "PAS", "PIAC", "PIAS")
 IPD_BAR_COLOUR = "#32AAFF"
 IPD_EVENT_GREEN = "#52DEAD"
+IPD_LAUNCHED_FILL = "#DCF8EF"
 IPD_PAST_GATE_FILL = "#DCF8EF"
 IPD_LAUNCH_OUTLINE = "#FA6157"
 IPD_PAST_LAUNCH_FILL = "#FEDFDD"
@@ -1337,16 +1375,67 @@ def ipd_read_workbook(content, sheet_name, header_row=IPD_DEFAULT_HEADER_ROW):
     return projects, milestones, pd.concat([section_issues, issues], ignore_index=True)
 
 
-def ipd_pipeline_values(projects):
-    """Sum @5YM values and count contributing projects by launch year and segment."""
-    columns = ["Year", "Metric", "Segment", f"Value ({IPD_PIPELINE_UNIT})", "Project count"]
+def ipd_pipeline_stage(value):
+    """Map a current-gate code or description to its stage, without inferring dates."""
+    text = ipd_cell_text(value)
+    gate = re.search(r"\b(?:g|gate)\s*([1-6])\b", text, flags=re.IGNORECASE)
+    if gate:
+        return IPD_PHASE_ORDER[int(gate[1]) - 1]
+    if re.fullmatch(r"[1-6]", text):
+        return IPD_PHASE_ORDER[int(text) - 1]
+    return next((stage for stage in IPD_PHASE_ORDER if stage.casefold() == text.casefold()), IPD_UNKNOWN_STAGE)
+
+
+def ipd_pipeline_groups(projects, view_portfolio):
+    """Keep unclassified projects in the totals and order stages from G1 to G6."""
+    lookup = {ipd_cell_text(column).casefold(): column for column in projects}
+    if view_portfolio == "Stage":
+        column = lookup.get(IPD_CURRENT_GATE.casefold())
+        groups = (projects[column].map(ipd_pipeline_stage) if column is not None
+                  else pd.Series(IPD_UNKNOWN_STAGE, index=projects.index))
+        order = [stage for stage in (*IPD_PHASE_ORDER, IPD_UNKNOWN_STAGE) if stage in groups.values]
+    else:
+        column = lookup.get("market segment")
+        groups = (projects[column].map(ipd_cell_text).replace("", "(Blank)") if column is not None
+                  else pd.Series("All projects", index=projects.index))
+        order = sorted(groups.unique(), key=str.casefold)
+    return groups, order
+
+
+def ipd_annual_pipeline_values(projects, *, view_portfolio="Segment"):
+    """Sum imported PAS/PIAS values by source year and the selected grouping."""
+    columns = ["Year", "Metric", view_portfolio, f"Value ({IPD_PIPELINE_UNIT})", "Project count"]
+    financial = {}
+    for column in ipd_financial_columns(projects):
+        metric, year = column.split("_", 1)
+        if metric in ("PAS", "PIAS"):
+            financial[metric, year] = pd.to_numeric(projects[column], errors="coerce")
+    if projects.empty or not any(values.notna().any() for values in financial.values()):
+        return pd.DataFrame(columns=columns)
+    groups, group_order = ipd_pipeline_groups(projects, view_portfolio)
+    years = sorted({year for _, year in financial}, key=lambda year: int(year.removeprefix("Year ")))
+    missing = pd.Series(pd.NA, index=projects.index, dtype="Float64")
+    records = []
+    for year in years:
+        label = year if year.startswith("Year ") else int(year)
+        for metric in ("PAS", "PIAS"):
+            amounts = financial.get((metric, year), missing)
+            for group in group_order:
+                contributions = amounts.loc[groups.eq(group)]
+                records.append((label, metric, group, contributions.sum(min_count=1),
+                                int(contributions.count())))
+    return pd.DataFrame(records, columns=columns)
+
+
+def ipd_pipeline_values(projects, *, by_quarter=False, view_portfolio="Segment"):
+    """Sum @5YM values and contributor counts by launch period and grouping."""
+    columns = ["Year", *(["Quarter"] if by_quarter else []),
+               "Metric", view_portfolio, f"Value ({IPD_PIPELINE_UNIT})", "Project count"]
     projects = projects.loc[projects["End"].notna()]
     if projects.empty:
         return pd.DataFrame(columns=columns)
     lookup = {ipd_cell_text(column).casefold(): column for column in projects}
-    segment_column = lookup.get("market segment")
-    segments = (projects[segment_column].map(ipd_cell_text).replace("", "(Blank)")
-                if segment_column is not None else pd.Series("All projects", index=projects.index))
+    groups, group_order = ipd_pipeline_groups(projects, view_portfolio)
     amounts = {}
     for metric in ("PAS", "PIAS"):
         column = lookup.get(IPD_ACTIVITY_METRICS[metric].casefold())
@@ -1360,15 +1449,20 @@ def ipd_pipeline_values(projects):
     if not any(values.notna().any() for values in amounts.values()):
         return pd.DataFrame(columns=columns)
     launch_years = projects["End"].dt.year
+    launch_quarters = projects["End"].dt.quarter
     records = []
     for year in range(int(launch_years.min()), int(launch_years.max()) + 1):
-        launched = launch_years.eq(year)
-        for metric in ("PAS", "PIAS"):
-            for segment in sorted(segments.unique(), key=str.casefold):
-                selected = segments.eq(segment) & launched
-                contributions = amounts[metric].loc[selected]
-                total = contributions.sum(min_count=1) if launched.any() else 0.0
-                records.append((year, metric, segment, total, int(contributions.count())))
+        for quarter in range(1, 5) if by_quarter else [None]:
+            launched = launch_years.eq(year)
+            if by_quarter:
+                launched &= launch_quarters.eq(quarter)
+            period = (year, quarter) if by_quarter else (year,)
+            for metric in ("PAS", "PIAS"):
+                for group in group_order:
+                    selected = groups.eq(group) & launched
+                    contributions = amounts[metric].loc[selected]
+                    total = contributions.sum(min_count=1) if launched.any() else 0.0
+                    records.append((*period, metric, group, total, int(contributions.count())))
     return pd.DataFrame(records, columns=columns)
 
 
@@ -1391,45 +1485,55 @@ def fixed_type0_bar_labels(figure):
     figure.update_traces(selector=dict(type="scatter"), textfont_size=TYPE0_VALUE_LABEL_SIZE)
 
 
-def ipd_pipeline_segment_label(amount, metric, project_count=None, *, value_decimals=0):
-    """Label a visible segment, adding the contributor count only for PAS."""
+def ipd_pipeline_segment_label(amount, metric, project_count=None, *, value_decimals=0, count_metric="PAS"):
+    """Label a visible segment, including counts for the selected count metric."""
     if pd.isna(amount) or amount == 0:
         return ""
     label = f"{amount:,.{value_decimals}f}"
-    if metric == "PAS" and project_count is not None and pd.notna(project_count):
+    if metric == count_metric and project_count is not None and pd.notna(project_count):
         label += f" (# {int(project_count)})"
     return label
 
 
 def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_segments=False,
-                  legend_below=False, value_fontweight="normal", title="IPD Pipeline", millions=False):
-    """Draw PAS beside PIAS for each year, stacked by market segment."""
+                  legend_below=False, value_fontweight="normal", title="IPD Pipeline", millions=False,
+                  show_project_counts=True):
+    """Draw selected metrics beside each other, stacked by segment or stage."""
     if values.empty:
         raise ValueError("There are no PAS/PIAS pipeline values to plot.")
-    years = values["Year"].unique().tolist()
-    segments = values["Segment"].unique().tolist()
+    quarterly = "Quarter" in values
+    period_columns = ["Year", "Quarter"] if quarterly else ["Year"]
+    periods = list(values[period_columns].drop_duplicates().itertuples(index=False, name=None))
+    metrics = values["Metric"].unique().tolist()
+    count_metric = "PIAS" if metrics == ["PIAS"] else "PAS"
+    group_column = "Stage" if "Stage" in values else "Segment"
+    segments = values[group_column].unique().tolist()
     divisor = 1000 if millions else 1
     label_size = TYPE0_VALUE_LABEL_SIZE * 72 / 96 if millions else 8
     # Each segment has the same colour in both metrics and every year.
     segment_colours = {ipd_cell_text(segment).casefold(): colour
                        for segment, colour in (segment_colours or {}).items()}
+    if group_column == "Stage":
+        segment_colours.update({stage.casefold(): colour for stage, colour in IPD_STAGE_COLOURS.items()})
+        segment_colours[IPD_UNKNOWN_STAGE.casefold()] = "#8A94A3"
     colours = ("#32AAFF", "#52B788", "#F4A261", "#9B72CF", "#E76F51",
                "#36A6A6", "#D6AD30", "#CF79A3", "#687DA8", "#8C9561")
     legend_rows = math.ceil(len(segments) / 5)
-    fig = Figure(figsize=(max(12, len(years) * 1.7), 6 + legend_rows * 0.3), facecolor="white")
+    fig = Figure(figsize=(max(12, len(periods) * 1.7), 6 + legend_rows * 0.3), facecolor="white")
     FigureCanvasAgg(fig)
     ax = fig.add_subplot()
     ax.set_facecolor("white")
     fig.suptitle(title, fontsize=16, fontweight="bold", color=GREY, y=0.98)
-    bars = [(year, metric) for year in years for metric in ("PAS", "PIAS")]
-    positions = [index + offset for index in range(len(years)) for offset in (-0.2, 0.2)]
+    bars = [(*period, metric) for period in periods for metric in metrics]
+    offsets = (-0.2, 0.2) if len(metrics) == 2 else (0,)
+    positions = [index + offset for index in range(len(periods)) for offset in offsets]
     positive, negative = [0.0] * len(bars), [0.0] * len(bars)
     totals, known = [0.0] * len(bars), [False] * len(bars)
-    lookup = values.set_index(["Year", "Metric", "Segment"])
+    lookup = values.set_index([*period_columns, "Metric", group_column])
     for index, segment in enumerate(segments):
         heights, bottoms = [], []
-        for bar, (year, metric) in enumerate(bars):
-            amount = lookup.loc[(year, metric, segment), f"Value ({IPD_PIPELINE_UNIT})"]
+        for bar, key in enumerate(bars):
+            amount = lookup.loc[(*key, segment), f"Value ({IPD_PIPELINE_UNIT})"]
             valid = pd.notna(amount)
             height = float(amount) / divisor if valid else 0.0
             heights.append(height)
@@ -1443,39 +1547,46 @@ def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_s
         ax.bar(positions, heights, width=0.35, bottom=bottoms, label=segment,
                color=segment_colours.get(ipd_cell_text(segment).casefold(), colours[index % len(colours)]),
                edgecolor="white", linewidth=0.5, zorder=3)
-    counts = (values.groupby(["Year", "Metric"])["Project count"].sum()
-              if "Project count" in values else None)
-    for (year, metric), x, top, total, valid in zip(bars, positions, positive, totals, known):
+    counts = (values.groupby([*period_columns, "Metric"])["Project count"].sum()
+              if show_project_counts and "Project count" in values else None)
+    for key, x, top, total, valid in zip(bars, positions, positive, totals, known):
         label = f"{total:,.{value_decimals}f}" if valid else "—"
         if millions:
             label = type0_million_label(total / divisor) if valid else "—"
         elif value_decimals:
             label = label.rstrip("0").rstrip(".")
-        if metric == "PAS" and counts is not None:
-            label += f" (# {int(counts.loc[(year, metric)])})"
+        if key[-1] == count_metric and counts is not None:
+            label += f" (# {int(counts.loc[key])})"
         ax.annotate(label, (x, top), xytext=(0, 6), textcoords="offset points",
                     ha="center", va="bottom", fontsize=label_size, color="black", fontweight=value_fontweight)
     if label_segments:
         for segment, container in zip(segments, ax.containers):
             labels = []
-            for bar, (year, metric) in zip(container, bars):
-                count = (lookup.loc[(year, metric, segment), "Project count"]
-                         if "Project count" in lookup else None)
+            for bar, key in zip(container, bars):
+                metric = key[-1]
+                count = (lookup.loc[(*key, segment), "Project count"]
+                         if show_project_counts and "Project count" in lookup else None)
                 if millions:
                     # Label source values: rectangle geometry may lose precision at half-decimal boundaries.
-                    amount = lookup.loc[(year, metric, segment), f"Value ({IPD_PIPELINE_UNIT})"]
-                    labels.append(type0_million_label(float(amount) / divisor, count if metric == "PAS" else None)
+                    amount = lookup.loc[(*key, segment), f"Value ({IPD_PIPELINE_UNIT})"]
+                    labels.append(type0_million_label(float(amount) / divisor, count if metric == count_metric else None)
                                   if pd.notna(amount) and amount != 0 else "")
                 else:
                     labels.append(ipd_pipeline_segment_label(bar.get_height(), metric, count,
-                                                             value_decimals=value_decimals))
+                                                             value_decimals=value_decimals, count_metric=count_metric))
             ax.bar_label(container, labels=labels, label_type="center", fontsize=label_size, color="white",
                          fontweight=value_fontweight)
-    ax.set_xticks(positions, [metric for _, metric in bars], fontsize=8, color=GREY)
-    for index, year in enumerate(years):
-        ax.text(index, -0.09, year, transform=ax.get_xaxis_transform(), ha="center",
+    ax.set_xticks(positions, [key[-1] for key in bars], fontsize=8, color=GREY)
+    for index, period in enumerate(periods):
+        ax.text(index, -0.09, f"Q{period[1]}" if quarterly else period[0],
+                transform=ax.get_xaxis_transform(), ha="center",
                 va="top", fontsize=10, color=GREY, fontweight="bold")
-    ax.set_xlabel("Year", labelpad=38, color=GREY)
+    if quarterly:
+        for year in values["Year"].unique():
+            indices = [index for index, period in enumerate(periods) if period[0] == year]
+            ax.text(sum(indices) / len(indices), -0.15, str(year), transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=10, color=GREY, fontweight="bold")
+    ax.set_xlabel("Year", labelpad=60 if quarterly else 38, color=GREY)
     ax.set_ylabel(f"Value ({'M EUR' if millions else IPD_PIPELINE_UNIT})", color=GREY)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.1f}" if millions else f"{value:,.0f}"))
     ax.tick_params(axis="both", length=0, colors=GREY)
@@ -1483,7 +1594,7 @@ def ipd_plot_pipeline(values, *, segment_colours=None, value_decimals=2, label_s
     ax.grid(axis="both", which="major", color="#E8EBEF", linewidth=0.8, zorder=0)
     ax.axhline(0, color="#B8BEC7", linewidth=0.8, zorder=2)
     add_plot_border(ax)
-    ax.set_xlim(-0.65, len(years) - 0.35)
+    ax.set_xlim(-0.65, len(periods) - 0.35)
     lower, upper = min(negative), max(positive)
     span = upper - lower or 1
     ax.set_ylim(lower - (0.08 * span if lower < 0 else 0), upper + 0.18 * span)
@@ -1578,7 +1689,8 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
                           if ipd_cell_text(column).casefold() == "project status"), None)
     statuses = (projects[status_column].map(ipd_cell_text).str.casefold()
                 if status_column is not None else pd.Series("", index=projects.index))
-    launched = statuses.eq("launched") & ipd_project_phases(projects).eq("Post Launch")
+    launched = statuses.eq("launched")
+    launched_markers = launched & ipd_project_phases(projects).eq("Post Launch")
     reference_date = pd.Timestamp(reference_date or today or date.today()).normalize()
     cutoff = pd.Timestamp(start_date).normalize() if start_date is not None else None
     event_groups = []
@@ -1715,10 +1827,13 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
             tick.set_ha("left")
 
     gate_font = FontProperties(family="DejaVu Sans", size=7)
-    for (_, row), y, groups, is_launched in zip(projects.iterrows(), positions, event_groups, launched):
+    for (_, row), y, groups, is_launched, launched_marker in zip(
+            projects.iterrows(), positions, event_groups, launched, launched_markers):
         if row["Valid dates"]:
-            ax.plot([row["Start"], row["End"]], [y, y], color=IPD_BAR_COLOUR,
-                    linewidth=4.5, solid_capstyle="round", zorder=2)
+            ax.plot([row["Start"], row["End"]], [y, y],
+                    color=IPD_EVENT_GREEN if is_launched else IPD_BAR_COLOUR,
+                    linewidth=4.5, linestyle=PROJECT_DOT_LINESTYLE if is_launched else "-",
+                    solid_capstyle="round", dash_capstyle="round", zorder=2)
         else:
             ax.text(0.01, y + 7, "Missing/invalid project dates", transform=ax.get_yaxis_transform(),
                     color=IPD_ERROR_COLOUR, fontsize=7, va="center", zorder=6,
@@ -1730,8 +1845,9 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
                 past_colour = IPD_PAST_GATE_FILL if marker == "D" else IPD_PAST_LAUNCH_FILL
                 outline_colour = IPD_EVENT_GREEN if marker == "D" else IPD_LAUNCH_OUTLINE
                 fill_colour = past_colour if stamp <= reference_date else "white"
-                if marker == "^" and is_launched:
-                    outline_colour = fill_colour = IPD_EVENT_GREEN
+                if marker == "^" and launched_marker:
+                    outline_colour = IPD_EVENT_GREEN
+                    fill_colour = IPD_LAUNCHED_FILL
                 ax.plot(stamp, event_y, marker=marker, markersize=IPD_EVENT_SIZE,
                         markerfacecolor=fill_colour,
                         markeredgecolor=outline_colour, markeredgewidth=1.3,
@@ -1757,6 +1873,8 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
              f"{len(milestones.loc[milestones['Excel row'].isin(projects['Excel row'])])} milestones",
              fontsize=10, va="top", color=GREY)
     handles = [Line2D([], [], color=IPD_BAR_COLOUR, linewidth=4.5, label="Project duration"),
+               Line2D([], [], color=IPD_EVENT_GREEN, linewidth=4.5, linestyle=PROJECT_DOT_LINESTYLE,
+                      dash_capstyle="round", label="Launched project duration"),
                Line2D([], [], color=IPD_EVENT_GREEN, marker="D", markersize=IPD_EVENT_SIZE,
                       markerfacecolor=IPD_PAST_GATE_FILL, linestyle="none", label="Past gates"),
                Line2D([], [], color=IPD_EVENT_GREEN, marker="D", markersize=IPD_EVENT_SIZE,
@@ -1764,7 +1882,7 @@ def ipd_plot_gantt(projects, milestones, today=None, limits=None, page_label="",
                Line2D([], [], color=IPD_LAUNCH_OUTLINE, marker="^", markersize=IPD_EVENT_SIZE,
                       markerfacecolor="white", linestyle="none", label="Planned launch date"),
                Line2D([], [], color=IPD_EVENT_GREEN, marker="^", markersize=IPD_EVENT_SIZE,
-                      markerfacecolor=IPD_EVENT_GREEN, linestyle="none", label="Launched")]
+                      markerfacecolor=IPD_LAUNCHED_FILL, linestyle="none", label="Launched")]
     if today is not None:
         handles.append(Line2D([], [], color=TODAY_COLOUR, linestyle="--", linewidth=0.8,
                               label=f"Today ({ipd_format_date(pd.Timestamp(today))})"))
@@ -2104,7 +2222,12 @@ def otmd_settings_key(source, sheet, header_row):
     return (source["digest"], source["name"], sheet, header_row, OTMD_CALCULATION_VERSION)
 
 
-def update_otmd_display(result, show_monthly=True, show_segments=True):
+def otmd_result_is_current(result, fingerprint, start_date, segments):
+    return (result is not None and result.get("fingerprint") == fingerprint
+            and result.get("start_date") == start_date and result.get("segments", ()) == segments)
+
+
+def update_otmd_display(result, show_monthly=True, show_segments=True, *, render_exports=True):
     """Keep the chart and downloads in sync while retaining all calculated values."""
     projects_only = result.get("projects_only", False)
     labels = on_time_labels(projects_only)
@@ -2114,15 +2237,19 @@ def update_otmd_display(result, show_monthly=True, show_segments=True):
     displayed = values if show_segments else values.loc[values["Segment"].eq("Total")]
     if not show_monthly:
         displayed = displayed.drop(columns=labels["metric"])
-    assets = {labels["csv"]:
-              displayed.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")}
-    if not values.empty:
-        assets[labels["png"]] = otmd_png(chart)
+    assets = {}
+    if render_exports:
+        assets[labels["csv"]] = displayed.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")
+        if not values.empty:
+            assets[labels["png"]] = otmd_png(chart)
     result.update(chart=chart, assets=assets, displayed_values=displayed,
                   display_options=(show_monthly, show_segments))
+    result.pop("zip", None)
+    result["download_revision"] = result.get("download_revision", 0) + 1
 
 
-def build_otmd_results(source, sheet, header_row, milestones, start_date=None, segments=None, *, projects_only=False):
+def build_otmd_results(source, sheet, header_row, milestones, start_date=None, segments=None, *, projects_only=False,
+                       render_outputs=True):
     """Filter milestone records, then calculate before applying the display cutoff."""
     if projects_only:
         milestones = ipd_g5_milestones(milestones)
@@ -2147,7 +2274,9 @@ def build_otmd_results(source, sheet, header_row, milestones, start_date=None, s
     result = dict(values=values, count=len(milestones), source_name=source["name"], sheet=sheet,
                   start_date=start_date, segments=selected_segments, projects_only=projects_only,
                   fingerprint=otmd_settings_key(source, sheet, header_row))
-    update_otmd_display(result)
+    result.update(assets={}, asset_lock=threading.RLock(), downloads_current=True, lazy_outputs_version=1)
+    if render_outputs:
+        update_otmd_display(result)
     return result
 
 
@@ -2165,25 +2294,157 @@ def load_data(mode, source, sheet):
     return data, notes
 
 
-def build_pipeline_results(projects, mode, start_date=None):
+def build_pipeline_results(projects, mode, start_date=None, *, render_png=True,
+                           show_pas=True, show_pias=True, by_quarter=False, use_annual_data=True,
+                           year_from=None, year_to=None, show_project_counts=True, view_portfolio="Segment"):
     """Use one aggregation for the interactive pipeline and PNG export."""
     if mode == "Type 0":
+        view_portfolio = "Segment"
         columns = {"Due Date": "End", "Segment": "Market segment",
                    "PAS (in k EUR)": IPD_ACTIVITY_METRICS["PAS"],
                    "PIAS (in k EUR)": IPD_ACTIVITY_METRICS["PIAS"]}
         projects = projects[list(columns)].rename(columns=columns)
-    if start_date is not None:
-        projects = projects.loc[projects["End"].ge(pd.Timestamp(start_date).normalize())]
-    values = ipd_pipeline_values(projects)
-    png = None
-    if not values.empty:
-        with render_lock():
-            fig = ipd_plot_pipeline(values, title=f"{mode} Pipeline", value_decimals=0,
-                                    label_segments=True, legend_below=True,
-                                    value_fontweight="normal", segment_colours=SEGMENT_COLOURS,
-                                    millions=mode == "Type 0")
-            png = figure_png(fig, dpi=180)
+    if mode == "IPD" and use_annual_data:
+        values = ipd_annual_pipeline_values(projects, view_portfolio=view_portfolio)
+    else:
+        if start_date is not None:
+            projects = projects.loc[projects["End"].ge(pd.Timestamp(start_date).normalize())]
+        values = ipd_pipeline_values(projects, by_quarter=by_quarter and mode == "IPD", view_portfolio=view_portfolio)
+    metrics = [metric for metric, show in (("PAS", show_pas), ("PIAS", show_pias)) if show]
+    selected = values["Metric"].isin(metrics)
+    if mode == "IPD":
+        years = pd.to_numeric(values["Year"].astype(str).str.removeprefix("Year "), errors="coerce")
+        if year_from is not None:
+            selected &= years.ge(year_from)
+        if year_to is not None:
+            selected &= years.le(year_to)
+    values = values.loc[selected].reset_index(drop=True)
+    png = (render_pipeline_png(values, mode, use_annual_data=use_annual_data, show_project_counts=show_project_counts)
+           if render_png else None)
     return dict(pipeline_values=values, pipeline_png=png)
+
+
+def ipd_pipeline_title(use_annual_data):
+    return f"IPD pipeline - {'10YR data' if use_annual_data else '@5YR data'}"
+
+
+def render_pipeline_png(values, mode, *, use_annual_data=True, show_project_counts=True):
+    if values.empty:
+        return None
+    with render_lock():
+        title = ipd_pipeline_title(use_annual_data) if mode == "IPD" else f"{mode} Pipeline"
+        fig = ipd_plot_pipeline(values, title=title, value_decimals=0,
+                                label_segments=True, legend_below=True,
+                                value_fontweight="normal", segment_colours=SEGMENT_COLOURS,
+                                millions=mode in {"Type 0", "IPD"}, show_project_counts=show_project_counts)
+        return figure_png(fig, dpi=180)
+
+
+def type0_project_ranking_figure(projects, metric="PAS", today=None):
+    """Rank the filtered projects, keeping unknown amounts below numeric values."""
+    if metric not in {"PAS", "PIAS"}:
+        raise ValueError("Choose PAS or PIAS for the project ranking.")
+    today = pd.Timestamp(today if today is not None else date.today()).normalize()
+    amount_column = f"{metric} (in k EUR)"
+    ranked = projects.copy().reset_index(drop=True)
+    ranked[amount_column] = ranked[amount_column].map(type0_numeric_value)
+    # Share planning statuses and labels, resolving PIAS ties before ranking.
+    ranked = type0_prepare_gantt_data(ranked, today=today)
+    ranked = ranked.sort_values(amount_column, ascending=False, kind="stable", na_position="last").reset_index(drop=True)
+    due_dates = ranked["Due Date"]
+    statuses = ranked["Timeline_Status"].where(~ranked["Is_Completed"], "Completed")
+    labels = ["".join(f"<b>{escape(text)}</b>" if bold else escape(text)
+                      for text, bold in parts) for parts in ranked["Activity_Parts"]]
+    labels = [f"{label} ({completed_date:%d/%m/%y})" if pd.notna(completed_date) else label
+              for label, completed_date in zip(labels, ranked["Completed_Latest_Due_Date"])]
+    colours = {**TYPE0_STATUS_COLOURS, "Completed": "#B1B1B1",
+               "Missing/invalid dates": TYPE0_STATUS_COLOURS["Overdue"]}
+    figure = go.Figure()
+    for status, colour in colours.items():
+        rows = ranked.loc[statuses.eq(status)]
+        if rows.empty:
+            continue
+        figure.add_bar(
+            name=status, orientation="h", y=rows.index.tolist(),
+            x=[None if pd.isna(value) else float(value) for value in rows[amount_column]],
+            width=0.65, marker_color=colour,
+            text=["" if pd.isna(value) else f"{value:,.0f}" for value in rows[amount_column]],
+            textposition="outside", cliponaxis=False,
+            customdata=[[labels[index], due_dates.loc[index].strftime("%d %b %Y")
+                         if pd.notna(due_dates.loc[index]) else "Missing / invalid"] for index in rows.index],
+            hovertemplate=("%{customdata[0]}<br>" + metric + ": %{x:,.2f} k EUR"
+                           "<br>Due Date: %{customdata[1]}<br>%{fullData.name}<extra></extra>"))
+    for index in ranked.index[ranked[amount_column].isna()]:
+        figure.add_annotation(x=0, y=index, text=f"No {metric} value", showarrow=False,
+                              xanchor="left", xshift=5, font=dict(color=GREY))
+    if ranked.empty:
+        figure.add_annotation(text="No projects in this selection.", x=0.5, y=0.5,
+                              xref="paper", yref="paper", showarrow=False)
+    figure.update_layout(
+        template="plotly_white", title=f"Project ranking · {metric}", title_font=dict(weight="bold"),
+        barmode="overlay", height=max(400, len(ranked) * 30 + 170),
+        margin=dict(l=40, r=90, t=70, b=100), font=dict(family="Arial, sans-serif", color="#35445a"),
+        xaxis_title=f"{metric} (k EUR)",
+        legend=dict(orientation="h", x=0, y=1.02, yanchor="bottom"),
+        hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", plot_bgcolor="white")
+    figure.update_xaxes(rangemode="tozero", tickformat=",.0f", showgrid=True,
+                        gridcolor="#E8EBEF", gridwidth=1,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    figure.update_yaxes(type="linear", tickmode="array", tickvals=list(range(len(ranked))), ticktext=labels,
+                        range=[len(ranked) - 0.5, -0.5] if len(ranked) else [0.5, -0.5],
+                        automargin=True, showgrid=False, zeroline=False,
+                        showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
+    return figure
+
+
+def type0_project_ranking_png(chart):
+    """Export the displayed ranking with its order, colours and planning labels."""
+    with render_lock():
+        label_parts = [[(unescape(part[3:-4]), True) if part.startswith("<b>") else (unescape(part), False)
+                        for part in re.split(r"(<b>.*?</b>)", label) if part]
+                       for label in chart.layout.yaxis.ticktext]
+        figure = Figure(figsize=(12, max(4.2, len(label_parts) * 0.3 + 1.8)), facecolor="white")
+        FigureCanvasAgg(figure)
+        renderer = figure.canvas.get_renderer()
+        label_width = max((sum(renderer.get_text_width_height_descent(
+            text, FontProperties(family="DejaVu Sans", size=9, weight="bold" if bold else "normal"), False
+        )[0] for text, bold in parts) / figure.dpi for parts in label_parts), default=0)
+        left = label_width + 0.35
+        width, height = left + 8, figure.get_figheight()
+        figure.set_figwidth(width)
+        ax = figure.add_axes([left / width, 0.65 / height, (width - left - 0.6) / width,
+                              (height - 1.65) / height])
+        for trace in chart.data:
+            bars = ax.barh(trace.y, [np.nan if value is None else value for value in trace.x],
+                           height=trace.width, color=trace.marker.color, label=trace.name)
+            ax.bar_label(bars, labels=trace.text, padding=4, fontsize=9, color="#35445a")
+        for index, parts in enumerate(label_parts):
+            ax.add_artist(AnnotationBbox(
+                type0_activity_box(parts), (0, index), xycoords=("axes fraction", "data"),
+                xybox=(-8, 0), boxcoords="offset points", box_alignment=(1, 0.5),
+                frameon=False, annotation_clip=False))
+        for annotation in chart.layout.annotations:
+            if annotation.xref == "paper":
+                ax.text(annotation.x, annotation.y, annotation.text, transform=ax.transAxes,
+                        ha="center", va="center", color="#35445a")
+            else:
+                ax.annotate(annotation.text, (annotation.x, annotation.y), xytext=(5, 0),
+                            textcoords="offset points", ha="left", va="center", fontsize=9, color=GREY)
+        ax.set_ylim(*chart.layout.yaxis.range)
+        ax.set_yticks([])
+        ax.margins(x=0.15)
+        ax.set_xlabel(chart.layout.xaxis.title.text, labelpad=12, color="#35445a")
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
+        ax.tick_params(axis="x", length=0, colors="#35445a", labelsize=9)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", color="#E8EBEF", linewidth=0.8)
+        add_plot_border(ax)
+        figure.text(left / width, 1 - 0.2 / height, chart.layout.title.text,
+                    ha="left", va="top", fontsize=13, fontweight="bold", color="#35445a")
+        if chart.data:
+            ax.legend(loc="lower left", bbox_to_anchor=(0, 1.01), ncol=len(chart.data),
+                      frameon=False, fontsize=8, borderaxespad=0)
+        return figure_png(figure, dpi=180)
 
 
 def type0_capex_values(projects):
@@ -2290,13 +2551,13 @@ def capex_png(chart):
         return figure_png(figure, dpi=180)
 
 
-def build_capex_results(projects):
+def build_capex_results(projects, *, render_outputs=True):
     values = type0_capex_values(projects)
-    chart = capex_figure(values)
+    chart = capex_figure(values) if render_outputs else None
     missing_dates = (projects["CAPEX (in k EUR)"].map(type0_numeric_value).gt(0) &
                      type0_convert_to_date(projects["Latest Due Date"], warn_invalid=False).isna())
     return dict(capex_values=values, capex_figure=chart,
-                capex_png=capex_png(chart) if not values.empty else None,
+                capex_png=capex_png(chart) if render_outputs and not values.empty else None,
                 capex_missing_dates=int(missing_dates.sum()))
 
 
@@ -2679,7 +2940,7 @@ def settings_key(source, sheet, options):
 
 
 def build_ipd_results(result):
-    """Render all pages once; the common builder owns tables and ZIP packaging."""
+    """Prepare page metadata without rendering any images."""
     projects, historical = result["projects"], result["historical_projects"]
     segment_column = next((column for column in projects
                            if ipd_cell_text(column).casefold() == "market segment"), None)
@@ -2700,8 +2961,6 @@ def build_ipd_results(result):
         today = result["settings"]["reference_date"] if result["settings"]["show_today"] else None
         group["limits"] = ipd_timeline_limits(selected, group["milestones"], today, result["settings"]["start_date"])
         result["segments"].append(group)
-        for page in range(1, math.ceil(len(selected) / result["settings"]["rows_per_page"]) + 1):
-            ipd_chart(group, page)
     return result
 
 
@@ -2714,14 +2973,15 @@ def planning_assets(result, mode):
         for segment, pages in result["chart_pages"].items():
             groups.append(dict(label=segment, pages=pages, message=result["messages"].get(segment),
                                count=counts[segment]))
-        assets = {**result["charts"], "Priority_Project_Checks.txt": result["report"].encode("utf-8")}
+        assets = dict(result["charts"])
     else:
         assets = {}
         for group in result["segments"]:
             pages = []
-            for page, png in group["charts"].items():
+            for page in range(1, math.ceil(len(group["projects"]) / result["settings"]["rows_per_page"]) + 1):
                 filename = f"{group['filename_prefix']}_{page}.png"
-                assets[filename] = png
+                if page in group["charts"]:
+                    assets[filename] = group["charts"][page]
                 pages.append(filename)
             groups.append(dict(label=group["label"], pages=pages, count=len(group["projects"]),
                                message=None if pages else "No projects in this segment match the selected filters and G1–G5 cutoff."))
@@ -2729,14 +2989,15 @@ def planning_assets(result, mode):
 
 
 def update_planning_results(result, rows_per_page, show_today, shade_years):
-    """Replace Gantt pages and the ZIP while retaining the generated filter scope."""
+    """Invalidate planning images while retaining other cached charts and tables."""
     if rows_per_page not in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100):
         raise ValueError("Choose 10, 20, 30, 40, 50, 60, 70, 80, 90, or 100 projects per chart.")
     updated = result.copy()
     if result["mode"] == "type0":
         updated["chart_request"] = {**result["chart_request"], "show_today": show_today, "shade_years": shade_years}
         with render_lock():
-            updated.update(type0_build_web_results(**updated["chart_request"], rows_per_page=rows_per_page))
+            updated.update(type0_build_web_results(**updated["chart_request"], rows_per_page=rows_per_page,
+                                                   render_charts=False))
     else:
         updated["settings"] = {**result["settings"], "rows_per_page": rows_per_page,
                                "show_today": show_today, "shade_years": shade_years}
@@ -2745,12 +3006,13 @@ def update_planning_results(result, rows_per_page, show_today, shade_years):
     previous_pages = {filename for group in result["groups"] for filename in group["pages"]}
     assets = {filename: content for filename, content in result["assets"].items() if filename not in previous_pages}
     assets.update(charts)
-    archive = zip_outputs(assets)
-    result.update(updated, groups=groups, assets=assets, zip=archive, rows_per_page=rows_per_page)
+    result.update(updated, groups=groups, assets=assets, rows_per_page=rows_per_page)
+    result.pop("zip", None)
+    result["download_revision"] = result.get("download_revision", 0) + 1
 
 
 def build_results(mode, source, sheet, data, options, selected):
-    """Generate each chart/CSV once and build one complete downloadable archive."""
+    """Prepare the filtered data; charts and export bytes are created on demand."""
     if mode == "type0":
         selection = options["selection"]
         chart_request = dict(
@@ -2762,23 +3024,21 @@ def build_results(mode, source, sheet, data, options, selected):
             all_priorities_by_segment=type0_select_web_projects(data, **selection, apply_priority=False),
             number_counts=type0_count_project_numbers(data))
         with render_lock():
-            result = type0_build_web_results(**chart_request, rows_per_page=options["rows_per_page"])
+            result = type0_build_web_results(**chart_request, rows_per_page=options["rows_per_page"],
+                                             render_charts=False)
         result["chart_request"] = chart_request
         projects = pd.concat(selected.values(), ignore_index=True)
-        result.update(build_pipeline_results(projects, "Type 0", start_date=options["start_date"]))
-        result.update(build_capex_results(projects))
         projects = projects[[col for col in projects if not col.startswith((".raw_date_", ".raw_numeric_"))]].copy()
         for column in projects.select_dtypes(include=["object", "string"]):
             projects[column] = projects[column].map(type0_cell_text)
         result["projects"] = projects
         tables = {"Projects.csv": projects, "Segment_summary.csv": result["summary"],
-                  "Checks_and_actions.csv": result["issues"], "CAPEX.csv": result["capex_values"]}
+                  "Checks_and_actions.csv": result["issues"]}
         result["missing_dates"] = int(projects["Due Date"].isna().sum())
     else:
         # The original renderer also supplies phase grouping and historical launch totals.
         result = build_ipd_results(selected)
         projects = result["projects"]
-        result.update(build_pipeline_results(projects, "IPD"))
         financial_columns = ipd_financial_columns(projects)
         tables = {"Projects.csv": projects.drop(columns=financial_columns).rename(
                     columns={"Start": IPD_START, "End": IPD_END_LABEL}),
@@ -2786,70 +3046,213 @@ def build_results(mode, source, sheet, data, options, selected):
                   "Financial_metrics.csv": projects[[IPD_PROJECT, IPD_DESCRIPTION, *financial_columns]]}
         result["missing_dates"] = int(projects["End"].isna().sum())
     groups, assets = planning_assets(result, mode)
-    if mode == "type0" and result["capex_png"] is not None:
-        assets["Type_0_CAPEX.png"] = result["capex_png"]
     pipeline_name = "Type_0_Pipeline.png" if mode == "type0" else "Type_IPD_Pipeline.png"
-    if result["pipeline_png"] is not None:
-        assets[pipeline_name] = result["pipeline_png"]
-    tables["Pipeline.csv"] = result["pipeline_values"]
-    result.update(build_time_to_market_results(projects, mode,
-                                              start_date=options["start_date"] if mode == "type0" else None))
-    tables["Time_to_market.csv"] = result["time_to_market_values"]
-    for filename, table in tables.items():
-        assets[filename] = table.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")
     result.update(groups=groups, tables=tables, assets=assets, pipeline_name=pipeline_name,
                   generation=secrets.token_hex(16), fingerprint=settings_key(source, sheet, options),
-                  source_name=source["name"], sheet=sheet, mode=mode, rows_per_page=options["rows_per_page"])
-    result["zip"] = zip_outputs(assets)
+                  source_name=source["name"], sheet=sheet, mode=mode, rows_per_page=options["rows_per_page"],
+                  analysis_start_date=options["start_date"] if mode == "type0" else None,
+                  asset_lock=threading.RLock(), downloads_current=True, lazy_outputs_version=1)
     return result
 
 
-def pipeline_figure(values, mode):
+def update_pipeline_options(result, show_pas=True, show_pias=True, by_quarter=False, use_annual_data=True,
+                            year_from=None, year_to=None, show_project_counts=True, view_portfolio="Segment"):
+    """Invalidate only pipeline outputs when its display controls change."""
+    options = (show_pas, show_pias, by_quarter, use_annual_data, year_from, year_to, show_project_counts, view_portfolio)
+    title = ipd_pipeline_title(use_annual_data) if result["mode"] == "ipd" else f"{MODES[result['mode']]} pipeline"
+    with result["asset_lock"]:
+        if result.get("pipeline_options") == options and result.get("pipeline_title") == title:
+            return
+        result["pipeline_options"] = options
+        result["pipeline_title"] = title
+        for key in ("pipeline_values", "pipeline_figure", "pipeline_png", "zip"):
+            result.pop(key, None)
+        result["tables"].pop("Pipeline.csv", None)
+        for filename in ("Pipeline.csv", result["pipeline_name"]):
+            result["assets"].pop(filename, None)
+        result["download_revision"] = result.get("download_revision", 0) + 1
+
+
+def ensure_analysis(result, tab, *, chart=True):
+    """Cache only the calculations/interactive figure needed by a tab or export."""
+    with result["asset_lock"]:
+        mode, projects = result["mode"], result["projects"]
+        if tab == "Pipeline":
+            show_pas, show_pias, by_quarter, use_annual_data, year_from, year_to, show_project_counts, view_portfolio = result.get(
+                "pipeline_options", (True, True, False, True, date.today().year, date.today().year + 5, True, "Segment"))
+            if "pipeline_values" not in result:
+                result.update(build_pipeline_results(projects, MODES[mode],
+                                                     result["analysis_start_date"], render_png=False,
+                                                     show_pas=show_pas, show_pias=show_pias, by_quarter=by_quarter,
+                                                     use_annual_data=use_annual_data,
+                                                     year_from=year_from, year_to=year_to,
+                                                     show_project_counts=show_project_counts, view_portfolio=view_portfolio))
+                result["tables"]["Pipeline.csv"] = result["pipeline_values"]
+            if chart and result.get("pipeline_figure") is None:
+                result["pipeline_figure"] = pipeline_figure(result["pipeline_values"], mode,
+                                                            use_annual_data=use_annual_data,
+                                                            show_project_counts=show_project_counts)
+        elif tab == "CAPEX":
+            if "capex_values" not in result:
+                result.update(build_capex_results(projects, render_outputs=False))
+                result["tables"]["CAPEX.csv"] = result["capex_values"]
+            if chart and result.get("capex_figure") is None:
+                result["capex_figure"] = capex_figure(result["capex_values"])
+        elif tab == "Time to market":
+            if "time_to_market_values" not in result:
+                result.update(build_time_to_market_results(projects, mode, start_date=result["analysis_start_date"]))
+                result["tables"]["Time_to_market.csv"] = result["time_to_market_values"]
+            if chart and result.get("time_to_market_figure") is None:
+                result["time_to_market_figure"] = time_to_market_figure(result["time_to_market_values"], mode)
+
+
+def planning_png(result, filename):
+    """Render and cache a single selected planning page, also reused for download."""
+    with result["asset_lock"]:
+        if filename not in result["assets"]:
+            if result["mode"] == "type0":
+                with render_lock():
+                    figure = type0_plot_gantt(**result["chart_jobs"][filename])
+                    png = figure_png(figure, result["chart_dpi"])
+            else:
+                group_index, page = next((index, group["pages"].index(filename) + 1)
+                                        for index, group in enumerate(result["groups"]) if filename in group["pages"])
+                png = ipd_chart(result["segments"][group_index], page)
+            result["assets"][filename] = png
+        return result["assets"][filename]
+
+
+def export_filenames(result):
+    """List available exports without calculating charts or encoding files."""
+    if "mode" not in result:
+        labels = on_time_labels(result.get("projects_only", False))
+        return [labels["csv"], *([labels["png"]] if not result["values"].empty else [])]
+    names = ["Priority_Project_Checks.txt"] if result["mode"] == "type0" else []
+    names += [name for name in result["tables"] if name not in {"Pipeline.csv", "CAPEX.csv", "Time_to_market.csv"}]
+    if result["mode"] == "type0":
+        names += ["CAPEX.csv", "Type_0_CAPEX.png"]
+        names += [f"Type_0_Project_ranking_{metric}.png" for metric in ("PAS", "PIAS")]
+    names += ["Pipeline.csv", result["pipeline_name"], "Time_to_market.csv",
+              "Type_0_Time_to_market.png" if result["mode"] == "type0" else "Type_IPD_Time_to_market.png"]
+    names += [filename for group in result["groups"] for filename in group["pages"]]
+    return names
+
+
+def export_bytes(result, filename):
+    """Create only the requested file, with a per-result lock for download threads."""
+    with result["asset_lock"]:
+        if filename.endswith(".zip"):
+            if "zip" not in result:
+                files = {name: data for name in export_filenames(result)
+                         if (data := export_bytes(result, name)) is not None}
+                result["zip"] = zip_outputs(files)
+            return result["zip"]
+        if filename in result["assets"]:
+            return result["assets"][filename]
+        if "mode" not in result:
+            labels = on_time_labels(result.get("projects_only", False))
+            if "chart" not in result:
+                update_otmd_display(result, render_exports=False)
+            if filename == labels["csv"]:
+                content = result["displayed_values"].to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")
+            elif filename == labels["png"] and not result["values"].empty:
+                content = otmd_png(result["chart"])
+            else:
+                return None
+        elif filename == "Priority_Project_Checks.txt":
+            content = result["report"].encode("utf-8")
+        elif result["mode"] == "type0" and filename in {
+                "Type_0_Project_ranking_PAS.png", "Type_0_Project_ranking_PIAS.png"}:
+            metric = Path(filename).stem.rsplit("_", 1)[-1]
+            content = type0_project_ranking_png(type0_project_ranking_figure(
+                result["projects"], metric, result["chart_request"]["today"]))
+        elif any(filename in group["pages"] for group in result["groups"]):
+            return planning_png(result, filename)
+        else:
+            tab = ("Pipeline" if filename in {"Pipeline.csv", result["pipeline_name"]} else
+                   "CAPEX" if filename in {"CAPEX.csv", "Type_0_CAPEX.png"} else
+                   "Time to market" if filename in {"Time_to_market.csv", "Type_0_Time_to_market.png",
+                                                    "Type_IPD_Time_to_market.png"} else None)
+            if tab:
+                ensure_analysis(result, tab, chart=filename.endswith(".png"))
+            if filename in result["tables"]:
+                content = result["tables"][filename].to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig")
+            elif tab == "Pipeline":
+                options = result.get("pipeline_options", (True, True, False, True, None, None, True, "Segment"))
+                content = render_pipeline_png(result["pipeline_values"], MODES[result["mode"]],
+                                               use_annual_data=options[3], show_project_counts=options[6])
+                result["pipeline_png"] = content
+            elif tab == "CAPEX":
+                content = capex_png(result["capex_figure"]) if not result["capex_values"].empty else None
+                result["capex_png"] = content
+            elif tab == "Time to market":
+                content = time_to_market_png(result["time_to_market_figure"])
+            else:
+                raise ValueError(f"Unknown export: {filename}")
+        if content is not None:
+            result["assets"][filename] = content
+        return content
+
+
+def pipeline_figure(values, mode, *, use_annual_data=True, show_project_counts=True):
     """Interactive counterpart of the shared, exportable pipeline PNG."""
     figure = go.Figure()
-    millions = mode == "type0"
+    millions = mode in {"type0", "ipd"}
     divisor = 1000 if millions else 1
+    group_column = "Stage" if "Stage" in values else "Segment"
     if values.empty:
-        figure.add_annotation(text="No numeric PAS/PIAS values with valid dates in this selection.",
+        figure.add_annotation(text="No numeric PAS/PIAS values available for this selection.",
                               x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
     else:
-        pairs = list(dict.fromkeys(zip(values["Year"], values["Metric"])))
-        x = [[str(year) for year, _ in pairs], [metric for _, metric in pairs]]
+        quarterly = "Quarter" in values
+        count_metric = "PIAS" if values["Metric"].unique().tolist() == ["PIAS"] else "PAS"
+        bar_columns = ["Year", *(["Quarter"] if quarterly else []), "Metric"]
+        pairs = list(values[bar_columns].drop_duplicates().itertuples(index=False, name=None))
+        x = [[str(pair[0]) for pair in pairs],
+             [f"Q{pair[1]} · {pair[-1]}" if quarterly else pair[-1] for pair in pairs]]
         fallback = ["#52B788", "#9B72CF", "#36A6A6", "#E76F51"]
-        for index, segment in enumerate(values["Segment"].unique()):
-            rows = values.loc[values["Segment"].eq(segment)].set_index(["Year", "Metric"])
+        colours = ({**IPD_STAGE_COLOURS, IPD_UNKNOWN_STAGE: "#8A94A3"}
+                   if group_column == "Stage" else SEGMENT_COLOURS)
+        for index, segment in enumerate(values[group_column].unique()):
+            rows = values.loc[values[group_column].eq(segment)].set_index(bar_columns)
             y = [None if pd.isna(rows.loc[pair, "Value (k EUR)"]) else float(rows.loc[pair, "Value (k EUR)"]) / divisor
                  for pair in pairs]
             labels = []
             for value, pair in zip(y, pairs):
-                count = rows.loc[pair, "Project count"] if "Project count" in rows else None
-                labels.append((type0_million_label(value, count if pair[1] == "PAS" else None)
+                count = rows.loc[pair, "Project count"] if show_project_counts and "Project count" in rows else None
+                labels.append((type0_million_label(value, count if pair[-1] == count_metric else None)
                                if value is not None and value != 0 else "") if millions else
-                              ipd_pipeline_segment_label(value, pair[1], count))
-            figure.add_bar(name=segment, x=x, y=y, marker_color=SEGMENT_COLOURS.get(segment, fallback[index % len(fallback)]),
+                              ipd_pipeline_segment_label(value, pair[-1], count, count_metric=count_metric))
+            figure.add_bar(name=segment, x=x, y=y, marker_color=colours.get(segment, fallback[index % len(fallback)]),
                            text=labels, textposition="inside",
                            insidetextfont=dict(color="white"),
-                           customdata=[[str(year), metric, segment] for year, metric in pairs],
+                           customdata=[[f"{pair[0]} Q{pair[1]}" if quarterly else str(pair[0]), pair[-1], segment]
+                                       for pair in pairs],
                            hovertemplate=("%{customdata[2]} · %{customdata[0]} %{customdata[1]}<br>" +
                                           ("%{y:,.1f} M EUR" if millions else "%{y:,.0f} k EUR") + "<extra></extra>"))
         totals, tops = [], []
-        for year, metric in pairs:
-            rows = values.loc[values["Year"].eq(year) & values["Metric"].eq(metric)]
+        groups = values.groupby(bar_columns, sort=False)
+        for pair in pairs:
+            rows = groups.get_group(pair)
             numbers = rows["Value (k EUR)"]
             total = numbers.sum(min_count=1) / divisor
             label = type0_million_label(total) if millions else ("—" if pd.isna(total) else f"{total:,.0f}")
-            if metric == "PAS" and "Project count" in rows:
+            if show_project_counts and pair[-1] == count_metric and "Project count" in rows:
                 label += f" (# {int(rows['Project count'].sum())})"
             totals.append(label)
             tops.append(float(numbers.clip(lower=0).sum()) / divisor)
         figure.add_scatter(x=x, y=tops, text=totals, mode="text", textposition="top center",
                            textfont=dict(color="black"), showlegend=False, hoverinfo="skip", cliponaxis=False)
-    figure.update_layout(template="plotly_white", title=f"{MODES[mode]} pipeline",
+    if mode == "ipd":
+        figure.update_traces(selector=dict(type="bar"), insidetextanchor="middle", textangle=0)
+    title = ipd_pipeline_title(use_annual_data) if mode == "ipd" else f"{MODES[mode]} pipeline"
+    figure.update_layout(template="plotly_white", title=title,
                          title_font=dict(weight="bold"), barmode="relative",
                          height=530, margin=dict(l=60, r=25, t=70, b=100), font=dict(family="Arial, sans-serif", color="#35445a"),
                          yaxis_title=f"Value ({'M EUR' if millions else 'k EUR'})", legend=dict(orientation="h", y=-0.22, x=0),
                          hoverlabel=dict(bgcolor="white"), paper_bgcolor="white", plot_bgcolor="white",
-                         uirevision="pipeline")
+                         uirevision=("pipeline-" + group_column + "-" + ",".join(map(str, values["Year"].unique()))
+                                     if mode == "ipd" else "pipeline"))
     figure.update_xaxes(type="multicategory", title=None, tickson="labels", showgrid=True,
                         gridcolor="#E8EBEF", gridwidth=1,
                         showline=True, linecolor=CHART_BORDER_COLOR, linewidth=1, mirror=True)
@@ -2878,15 +3281,14 @@ APP_CSS = """
 .st-key-mode [role=radiogroup] { justify-content:center; }
 .st-key-mode, .st-key-data_files, .st-key-controls { background:#D6EEFF; border-radius:14px; }
 .st-key-results { background:white; border-radius:14px; }
-.st-key-mode h2, .st-key-data_files h2, .st-key-controls h2 { font-size:16px; }
-.st-key-mode, .st-key-data_files { padding:8px 14px; }
-.st-key-mode h2, .st-key-data_files h2 { margin:0; padding:0; line-height:1.25; }
+.st-key-mode, .st-key-data_files, .st-key-controls { padding:8px 14px; }
+.st-key-mode h2, .st-key-data_files h2, .st-key-controls h2, .st-key-controls h3 {
+  font-size:16px; margin:0; padding:0; line-height:1.25; }
 .st-key-mode [role=radiogroup], .st-key-mode [role=radiogroup] label { margin-block:0; }
 .st-key-workbook_header [data-testid=stMarkdownContainer] { margin:0; }
 .st-key-workbook_header h2 { margin:0; padding:0; line-height:1.25; }
 /* Adjust the container's 16px gap to 15px above and 20px below the separator. */
 .st-key-controls hr { margin:-1px 0 4px; }
-.st-key-controls h3 { font-size:14px; border-top:1px solid #edf0f5; padding-top:20px; }
 .st-key-controls [data-testid=stWidgetLabel] p,
 .st-key-data_files [data-testid=stWidgetLabel] p { font-size:12px; font-weight:600; color:#495b74; }
 .st-key-data_files [data-testid=stFileUploaderDropzone] { background:#f8faff;
@@ -2924,12 +3326,6 @@ APP_CSS += f"""
 .st-key-brand h1::before {{ content:''; display:block; flex-shrink:0;
   width:36px; height:36px; margin-right:10px; border-radius:50%;
   background-color:white; background-size:26px 26px; }}
-.st-key-workbook_header [data-testid=stBaseButton-primary] {{
-  background:{GENERATE_BUTTON_COLOR}; border-color:{GENERATE_BUTTON_COLOR};
-  color:{GENERATE_BUTTON_TEXT_COLOR};
-}}
-.st-key-workbook_header [data-testid=stBaseButton-primary]:hover:not(:disabled) {{ filter:brightness(.92); }}
-.st-key-workbook_header [data-testid=stBaseButton-primary]:disabled {{ opacity:.45; }}
 </style>
 """
 
@@ -2952,6 +3348,21 @@ def portfolio_state(mode):
     """Durable non-widget state survives switching portfolios and result tabs."""
     views = st.session_state.setdefault("portfolio_views", {})
     return views.setdefault(mode, dict(preferences={}, revision=0, upload_revision=0))
+
+
+def clear_generation_error(mode, error_key="generation_error"):
+    """Allow the failed request to run again, including from a Retry callback."""
+    view = portfolio_state(mode)
+    view.pop(error_key, None)
+    view.pop(error_key + "_fingerprint", None)
+
+
+def show_generation_error(mode, error_key="generation_error", *, ready=True):
+    view = portfolio_state(mode)
+    if view.get(error_key):
+        st.error(view[error_key])
+        st.button("Retry", key=f"retry_{mode}_{error_key}", disabled=not ready,
+                  on_click=clear_generation_error, args=(mode, error_key))
 
 
 def clear_workbook(mode):
@@ -3030,6 +3441,7 @@ def load_workbook(mode):
         view.pop("result", None)
         view.pop("data", None)
         view.pop("read_error", None)
+        clear_generation_error(mode)
         # Only selection widgets reset; the worksheet widget keeps its identity.
         view["selection_revision"] = view.get("selection_revision", 0) + 1
         try:
@@ -3061,7 +3473,7 @@ def workbook_section(mode, title):
 
 
 def load_otmd_workbook():
-    """Read and validate the sidebar milestone upload; charts wait for Generate charts."""
+    """Read and validate the sidebar milestone upload for automatic generation."""
     view = portfolio_state("otmd")
     controls = Controls("otmd", "workbook")
     key = f"_upload_otmd_{view['upload_revision']}"
@@ -3090,8 +3502,8 @@ def load_otmd_workbook():
                 st.session_state.pop(selection.prefix + "segments", None)
         view.pop("data", None)
         view.pop("read_error", None)
-        view.pop("generation_error", None)
-        view.pop("projects_error", None)
+        clear_generation_error("otmd")
+        clear_generation_error("otmd", "projects_error")
         try:
             view["data"] = ipd_read_otmd_workbook(source["content"], sheet, header_row)
         except Exception as exc:
@@ -3129,10 +3541,12 @@ def active_result_tab(mode):
         navigation = Controls(mode, f"results_{result['generation']}")
         return st.session_state.get(navigation.prefix + "active_tab",
                                     navigation.values.get("active_tab", "Project planning"))
-    if mode == "ipd" and portfolio_state("otmd").get("result") is not None:
+    milestone_view = portfolio_state("otmd") if mode == "ipd" else {}
+    if any(milestone_view.get(key) is not None for key in ("result", "projects_result")):
         navigation = Controls("otmd", "navigation")
+        default_tab = OTMD_TAB if milestone_view.get("result") is not None else POT_TAB
         return st.session_state.get(navigation.prefix + "active_tab",
-                                    navigation.values.get("active_tab", OTMD_TAB))
+                                    navigation.values.get("active_tab", default_tab))
     return None
 
 
@@ -3238,12 +3652,28 @@ def scope_controls(mode, data, active_tab=None, otmd_milestones=None):
 
 def download(label, result, filename, stale, key, **kwargs):
     mime = {".zip": "application/zip", ".png": "image/png", ".csv": "text/csv", ".txt": "text/plain"}
-    content = result["zip"] if filename.endswith(".zip") else result["assets"].get(filename)
-    # Stale data is not registered with the download endpoint, even for a disabled button.
-    st.download_button(label, data=content if content is not None and not stale else b"",
+    available = filename.endswith(".zip") or filename in export_filenames(result)
+    for name, values_key in ((result.get("pipeline_name"), "pipeline_values"), ("Type_0_CAPEX.png", "capex_values")):
+        if filename == name and values_key in result and result[values_key].empty:
+            available = False
+    revision = result.get("download_revision", 0)
+
+    def prepare_download():
+        # The callable runs in Streamlit's download thread. It uses this result's
+        # data and lock, never widgets or session state.
+        with result["asset_lock"]:
+            if not result.get("downloads_current", True) or result.get("download_revision", 0) != revision:
+                raise ValueError("The filters or chart settings changed. Please click the current download button.")
+            content = export_bytes(result, filename)
+            if content is None:
+                raise ValueError("There is no chart to download for this selection.")
+            return content
+
+    # A disabled/stale button must not register a callable or old file bytes.
+    st.download_button(label, data=prepare_download if available and not stale else b"",
                        file_name=filename, mime=mime[Path(filename).suffix], key=key,
-                       disabled=stale or content is None, on_click="ignore", width=180,
-                       help="Generate charts to download results for the current filters." if stale else None,
+                       disabled=stale or not available, on_click="ignore", width=180,
+                       help="Downloads are available when charts match the current filters." if stale else None,
                        **kwargs)
 
 
@@ -3289,7 +3719,7 @@ def data_table(frame, controls, name, *, paginate=True):
     st.dataframe(visible, hide_index=True, column_config=dates, width="stretch", height="auto")
 
 
-def show_metrics(result):
+def show_metrics(result, total_projects):
     projects, mode = result["projects"], result["mode"]
     amounts = ("PAS (in k EUR)", "PIAS (in k EUR)") if mode == "type0" else (IPD_ACTIVITY_METRICS["PAS"], IPD_ACTIVITY_METRICS["PIAS"])
     lookup = {str(column).casefold(): column for column in projects}
@@ -3304,7 +3734,7 @@ def show_metrics(result):
                 numbers.append(pd.NA)
         total = pd.Series(numbers, dtype="Float64").sum(min_count=1)
         totals.append("—" if pd.isna(total) else f"{total:,.0f}")
-    metrics = (("Selected projects", f"{len(projects):,}"), ("PAS · k EUR", totals[0]),
+    metrics = (("Selected projects", f"{len(projects):,} of {total_projects:,}"), ("PAS · k EUR", totals[0]),
                ("PIAS · k EUR", totals[1]), ("Checks & actions", f"{len(result['issues']):,}"))
     for column, (label, value) in zip(st.columns(4), metrics):
         column.metric(label, value)
@@ -3317,8 +3747,6 @@ def show_otmd(start_date=None, segments=(), *, projects_only=False):
     metric = "POT" if projects_only else "OTMD"
     controls = Controls("otmd", "projects_results" if projects_only else "results")
     result = view.get(labels["state"])
-    if projects_only and view.get("projects_error"):
-        st.warning(view["projects_error"])
     if result is None:
         if view.get("source") is None:
             st.info("Upload a milestone workbook in the left pane.")
@@ -3328,17 +3756,16 @@ def show_otmd(start_date=None, segments=(), *, projects_only=False):
             st.info("Projects on-time needs a 'Gate in Horizon' or 'Gate @ baseline' column in the milestone worksheet "
                     "to identify G5 records (for example G5 or G5@BaselineG4). "
                     "The existing baseline date column supplies the G5 target fixed at G4.")
-        elif not (projects_only and view.get("projects_error")):
-            st.info("Your milestone workbook is ready. Select Generate charts in the left pane.")
+        elif not view.get("projects_error" if projects_only else "generation_error"):
+            st.info("Choose a valid Start date in the left pane to display the milestone charts.")
         return
     stale = (bool(view.get("upload_error") or view.get("read_error")) or
-             bool(projects_only and view.get("projects_error")) or
-             result.get("fingerprint") != view.get("fingerprint") or
-             result.get("start_date") != start_date or
-             result.get("segments", ()) != segments)
+             bool(view.get("projects_error" if projects_only else "generation_error")) or
+             not otmd_result_is_current(result, view.get("fingerprint"), start_date, segments))
     if stale:
-        st.warning("Milestone workbook settings, Start date or Segment changed. Generate charts to apply them. "
+        st.warning("Charts could not be updated for the current milestone workbook settings or filters. "
                    f"Previous {metric} results are shown; {metric} downloads are disabled.")
+    result["downloads_current"] = not stale
     if result["values"].empty:
         st.info(f"No {metric} month-ends on or after the selected Start date."
                 if result["count"] and result.get("start_date") is not None
@@ -3349,7 +3776,13 @@ def show_otmd(start_date=None, segments=(), *, projects_only=False):
         show_monthly = controls.widget("checkbox", "show_monthly", f"Show monthly {labels['short']}", True)
         show_segments = controls.widget("checkbox", "show_segments", f"Show segment {labels['short']}", True)
     if result.get("display_options") != (show_monthly, show_segments):
-        update_otmd_display(result, show_monthly, show_segments)
+        try:
+            with result["asset_lock"]:
+                update_otmd_display(result, show_monthly, show_segments, render_exports=False)
+        except Exception as exc:
+            st.error(f"Unable to load {metric} chart: {exc}")
+            st.button("Retry", key=f"retry_chart_{metric}")
+            return
     with downloads:
         download("Download chart", result, labels["png"], stale, f"{metric}_png")
         download("Download monthly data", result, labels["csv"], stale, f"{metric}_csv")
@@ -3389,19 +3822,32 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
     planning = Controls(mode, "planning")
     view = portfolio_state(mode)
     selection = Controls(mode, f"selection_{view.get('selection_revision', 0)}")
+    pipeline_controls = Controls(mode, "pipeline")
+    pipeline_defaults = [("show_pas", True), ("show_pias", True)]
+    if mode == "ipd":
+        current_year = date.today().year
+        pipeline_defaults += [("by_quarter", False), ("use_annual_data", True),
+                              ("year_from", current_year), ("year_to", current_year + 5),
+                              ("show_project_counts", True), ("view_portfolio", "Segment")]
+    pipeline_options = [st.session_state.get(pipeline_controls.prefix + key,
+                                            pipeline_controls.values.get(key, default))
+                        for key, default in pipeline_defaults]
+    update_pipeline_options(result, *pipeline_options)
     chart_settings = result["chart_request"] if mode == "type0" else result["settings"]
     rows_per_page = st.session_state.get(planning.prefix + "rows", planning.values.get("rows", 30))
     show_today = st.session_state.get(selection.prefix + "show_today", selection.values.get("show_today", True))
     shade_years = st.session_state.get(selection.prefix + "shade_years", selection.values.get("shade_years", True))
     if (rows_per_page != result.get("rows_per_page", 30) or show_today != chart_settings["show_today"] or
             shade_years != chart_settings.get("shade_years", False)):
-        with st.spinner("Updating chart pages and downloads…"):
+        with result["asset_lock"]:
             update_planning_results(result, rows_per_page, show_today, shade_years)
-    show_metrics(result)
+    source_projects = view["data"] if mode == "type0" else view["data"][0]
+    show_metrics(result, len(source_projects))
     with st.container(border=True, key="results"):
         labels = ["Project planning", "Pipeline", "Time to market", "Projects", "Checks & actions"]
         if mode == "type0":
-            labels.insert(2, "CAPEX")
+            labels.insert(1, "Project ranking")
+            labels.insert(3, "CAPEX")
         else:
             labels[3:3] = ON_TIME_TABS
             labels.append("Financial metrics")
@@ -3414,6 +3860,14 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
             if not tab.open:
                 continue  # Avoid serializing large hidden tables/charts on every interaction.
             with tab:
+                if label in {"Pipeline", "CAPEX", "Time to market"}:
+                    try:
+                        ensure_analysis(result, label)
+                    except Exception as exc:
+                        st.error(f"Unable to load {label} chart: {exc}")
+                        # Clicking retries this on-demand chart on the next Streamlit run.
+                        st.button("Retry", key=f"retry_chart_{mode}_{label}")
+                        continue
                 if label == "Project planning":
                     with st.container(horizontal=True, vertical_alignment="bottom", key="planning_toolbar"):
                         segment = controls.widget("selectbox", "segment", "Segment", 0,
@@ -3432,6 +3886,13 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                                              width=180)
                         st.space("stretch")
                         filename = group["pages"][page - 1] if page else "Unavailable.png"
+                        if page:
+                            try:
+                                planning_png(result, filename)
+                            except Exception as exc:
+                                st.error(f"Unable to load chart: {exc}")
+                                st.button("Retry", key=f"retry_planning_{mode}")
+                                continue
                         download("Download chart", result, filename, stale, f"chart_{mode}")
                     with st.container(horizontal=True):
                         selection.widget("checkbox", "show_today", "Show today", True)
@@ -3444,15 +3905,63 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                     if mode == "type0":
                         with st.expander("Segment summary"):
                             data_table(result["summary"], controls, "summary")
+                elif label == "Project ranking":
+                    downloads = st.container(horizontal=True, horizontal_alignment="right")
+                    ranking_controls = Controls(mode, "ranking")
+                    metric = ranking_controls.widget(
+                        "segmented_control", "metric", "Ranking metric", "PIAS",
+                        options=["PAS", "PIAS"], required=True, wrap=False, label_visibility="collapsed")
+                    with downloads:
+                        download("Download chart", result, f"Type_0_Project_ranking_{metric}.png", stale,
+                                 f"ranking_png_type0_{metric}")
+                    reporting_date = result["chart_request"]["today"]
+                    st.plotly_chart(type0_project_ranking_figure(result["projects"], metric, reporting_date),
+                                    theme=None, width="stretch", key="ranking_type0",
+                                    config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
+                    st.caption(f"Project planning statuses as of {reporting_date:%d %b %Y}. "
+                               "Completed projects are grey. Incomplete projects with missing or invalid dates use red; "
+                               "projects without a numeric value appear at the bottom.")
                 elif label == "Pipeline":
                     with st.container(horizontal=True, horizontal_alignment="right"):
                         download("Download chart", result, result["pipeline_name"], stale, f"pipeline_png_{mode}")
-                    st.plotly_chart(result["pipeline_figure"], theme=None, width="stretch", key=f"pipeline_{mode}",
-                                     config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
-                elif label == "CAPEX":
-                    if "capex_values" not in result:
-                        st.info("Select Generate charts to add CAPEX requirements to these results.")
+                    with st.container(horizontal=True, wrap=False, vertical_alignment="bottom",
+                                      key=f"pipeline_toolbar_{mode}"):
+                        pipeline_controls.widget("checkbox", "show_pas", "PAS", True)
+                        pipeline_controls.widget("checkbox", "show_pias", "PIAS", True)
+                        if mode == "ipd":
+                            pipeline_controls.widget("checkbox", "show_project_counts", "# projects", True)
+                            pipeline_controls.widget("segmented_control", "use_annual_data", "Use data", True,
+                                                     options=[False, True], required=True, wrap=False, label_visibility="collapsed",
+                                                     format_func=lambda annual: "10YR" if annual else "@5YR",
+                                                     help="@5YR uses @5YM values grouped by launch date. "
+                                                          "10YR uses annual PAS and PIAS from Financial metrics.")
+                            pipeline_controls.widget("segmented_control", "view_portfolio", "View portfolio by", "Segment",
+                                                     options=["Segment", "Stage"], required=True, wrap=False,
+                                                     label_visibility="collapsed")
+                            pipeline_controls.widget("segmented_control", "by_quarter", "Period", False,
+                                                     options=[False, True], required=True, wrap=False, label_visibility="collapsed",
+                                                     format_func=lambda quarterly: "Quarter" if quarterly else "Year",
+                                                     disabled=pipeline_options[3], help="Quarterly grouping is available with @5YR.")
+                            pipeline_controls.widget("number_input", "year_from", "Year from", current_year,
+                                                     min_value=1, max_value=9999, step=1, format="%d", width=140,
+                                                     help="First year to show, inclusive. Leave empty for no lower limit.")
+                            pipeline_controls.widget("number_input", "year_to", "Year to", current_year + 5,
+                                                     min_value=1, max_value=9999, step=1, format="%d", width=140,
+                                                     help="Last year to show, inclusive. Leave empty for no upper limit.")
+                    chart_area = st.container()
+                    if (mode == "ipd" and pipeline_options[4] is not None and pipeline_options[5] is not None
+                            and pipeline_options[4] > pipeline_options[5]):
+                        chart_area.warning("Year from must be less than or equal to Year to.")
                         continue
+                    if not any(pipeline_options[:2]):
+                        chart_area.info("Select PAS or PIAS to show the pipeline chart.")
+                        continue
+                    if mode == "ipd" and pipeline_options[3] and result["pipeline_values"].empty:
+                        chart_area.info("No annual PAS/PIAS values are available for the selected years and projects. "
+                                        "Adjust the year range or select @5YR to use @5YM values.")
+                    chart_area.plotly_chart(result["pipeline_figure"], theme=None, width="stretch", key=f"pipeline_{mode}",
+                                            config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"], "responsive": True})
+                elif label == "CAPEX":
                     with st.container(horizontal=True, horizontal_alignment="right"):
                         download("Download chart", result, "Type_0_CAPEX.png", stale, "capex_png_type0")
                     st.plotly_chart(result["capex_figure"], theme=None, width="stretch", key="capex_type0",
@@ -3476,9 +3985,6 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                                     st.metric(row["Segment"], row["KPI"])
                                     st.caption(f"{row['Launch count']:,} " + ("launch" if row["Launch count"] == 1 else "launches"))
                     filename = "Type_0_Time_to_market.png" if mode == "type0" else "Type_IPD_Time_to_market.png"
-                    if filename not in result["assets"]:
-                        result["assets"][filename] = time_to_market_png(result["time_to_market_figure"])
-                        result["zip"] = zip_outputs(result["assets"])
                     with st.container(horizontal=True, horizontal_alignment="right"):
                         download("Download chart", result, filename, stale, f"ttm_png_{mode}")
                     st.plotly_chart(result["time_to_market_figure"], theme=None, width="stretch", key=f"ttm_{mode}",
@@ -3491,10 +3997,10 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
                               projects_only=label == POT_TAB)
                 elif label == "Projects":
                     if mode == "ipd":
-                        st.markdown("#### Projects")
+                        st.markdown("##### Projects")
                     data_table(result["tables"]["Projects.csv"], controls, "projects", paginate=False)
                     if mode == "ipd":
-                        st.markdown("#### Milestones")
+                        st.markdown("##### Milestones")
                         data_table(result["milestones"], controls, "milestones", paginate=False)
                 elif label == "Checks & actions":
                     st.caption(f"{len(result['issues']):,} checks & actions")
@@ -3520,20 +4026,19 @@ def show_results(result, stale, otmd_start_date=None, otmd_segments=(), pot_segm
     if controls.values["active_tab"] in ON_TIME_TABS:
         return
     with st.container(horizontal=True, wrap=False, vertical_alignment="bottom", gap="small"):
-        files = [filename for filename in result["assets"] if not filename.endswith(".png")]
+        files = [filename for filename in export_filenames(result) if not filename.endswith(".png")]
+        files.append("Portfolio_outputs.zip")
         filename = controls.widget("selectbox", "export", "Export a table or report", files[0], options=files,
                                     format_func=lambda value: value.replace("_", " "), width=400)
         download("Download file", result, filename, stale, f"file_{mode}")
 
 
-def show_empty_portfolio(mode, loaded, scope_error):
-    if loaded and not scope_error:
-        st.info("Your workbook is ready. Choose your scope and select Generate charts.")
+def show_empty_portfolio(mode):
     st.html(f'''<div class="empty-portfolio"><div class="icon" aria-hidden="true"></div>
         <h2>Explore your {MODES[mode]} portfolio</h2>
         <p>Bring your project workbook into one view. Review timelines, compare the pipeline,
         and turn data checks into actions.</p><div class="steps"><span>1  Upload workbook</span>
-        <span>2  Choose your scope</span><span>3  Generate charts</span></div>
+        <span>2  Explore charts</span><span>3  Refine filters</span></div>
         <p>Headings should be on row {6 if mode == 'type0' else 2}.</p></div>''')
 
 
@@ -3558,10 +4063,7 @@ def main():
             if mode == "ipd":
                 with workbook_section("otmd", "Milestone workbook"):
                     otmd_loaded = load_otmd_workbook()
-        with sidebar, st.container(border=True, key="controls"):
-            with st.container(key="workbook_header"):
-                generate_slot = st.empty()
-            count_slot = st.empty()
+        with sidebar, st.container(border=loaded is not None or otmd_loaded is not None, key="controls"):
             active_tab = active_result_tab(mode)
             otmd_active = mode == "ipd" and active_tab in ON_TIME_TABS
             otmd_milestones = otmd_loaded[3] if otmd_loaded is not None else None
@@ -3578,81 +4080,108 @@ def main():
                 try:
                     options, selected = select_scope(mode, data, values)
                     count = sum(map(len, selected.values())) if mode == "type0" else len(selected["projects"])
-                    total = len(data if mode == "type0" else data[0])
-                    if not otmd_active:
-                        count_slot.caption(f"{count:,} of {total:,} projects selected")
                     if mode == "ipd" and count == 0:
                         scope_error = "No projects match the selected filters and G1–G5 cutoff. Adjust your scope."
                 except ValueError as exc:
                     scope_error = str(exc)
                     if not otmd_active:
-                        count_slot.caption("Adjust the scope to continue")
+                        st.caption("Adjust the scope to continue")
             project_ready = loaded is not None and scope_error is None and not view.get("upload_error")
-            generate = generate_slot.button("Generate charts", type="primary", width="stretch", key=f"generate_{mode}",
-                                             disabled=not (project_ready or otmd_ready))
         with content:
-            if generate:
-                generated = False
-                with st.spinner("Generating charts and downloads…"):
-                    if project_ready:
+            previous_result = view.get("result")
+            project_fingerprint = settings_key(source, sheet, options) if project_ready else None
+            refresh_projects = project_ready and (
+                previous_result is None or previous_result.get("lazy_outputs_version") != 1 or
+                previous_result["fingerprint"] != project_fingerprint
+            )
+            if project_ready and previous_result is not None and not refresh_projects:
+                clear_generation_error(mode)
+            # Retry a failed request only on demand or after its inputs change.
+            refresh_projects = refresh_projects and view.get("generation_error_fingerprint") != project_fingerprint
+            milestone_updates = []
+            if otmd_ready:
+                milestone_view = portfolio_state("otmd")
+                for projects_only, segments, result_key, error_key in (
+                    (False, otmd_segments, "result", "generation_error"),
+                    (True, pot_segments, "projects_result", "projects_error"),
+                ):
+                    if projects_only and OTMD_GATE not in otmd_milestones:
+                        milestone_view.pop(result_key, None)
+                        clear_generation_error("otmd", error_key)
+                        continue
+                    previous_kpi = milestone_view.get(result_key)
+                    fingerprint = (milestone_view["fingerprint"], otmd_start_date, segments)
+                    current = (previous_kpi is not None and previous_kpi.get("lazy_outputs_version") == 1 and
+                               otmd_result_is_current(previous_kpi, *fingerprint))
+                    if current:
+                        clear_generation_error("otmd", error_key)
+                    elif milestone_view.get(error_key + "_fingerprint") != fingerprint:
+                        milestone_updates.append((projects_only, segments, result_key, error_key, fingerprint))
+            if refresh_projects or milestone_updates:
+                initialized_results = False
+                with st.spinner("Preparing portfolio…" if previous_result is None else "Updating portfolio…"):
+                    if refresh_projects:
                         try:
                             result = build_results(mode, source, sheet, data, options, selected)
-                            result["pipeline_figure"] = pipeline_figure(result["pipeline_values"], mode)
-                            result["time_to_market_figure"] = time_to_market_figure(result["time_to_market_values"], mode)
-                            view["result"] = result
-                            view.pop("generation_error", None)
-                            # Discard old table preferences, keeping the active on-time KPI tab.
-                            view["preferences"] = {key: value for key, value in view["preferences"].items()
-                                                   if not key.startswith("results_")}
-                            if active_tab in ON_TIME_TABS:
+                            if previous_result is not None:
+                                # Keep the active tab and table/navigation preferences during automatic refreshes.
+                                result["generation"] = previous_result["generation"]
+                                previous_result["downloads_current"] = False
+                            elif active_tab is not None:
                                 Controls(mode, f"results_{result['generation']}").values["active_tab"] = active_tab
-                            generated = True
+                            initialized_results |= previous_result is None
+                            view["result"] = result
+                            clear_generation_error(mode)
                         except Exception as exc:
                             view["generation_error"] = f"Unable to generate project charts: {exc}"
-                    if otmd_ready:
-                        milestone_view = portfolio_state("otmd")
+                            view["generation_error_fingerprint"] = project_fingerprint
+                    for projects_only, segments, result_key, error_key, fingerprint in milestone_updates:
                         try:
-                            milestone_view["result"] = build_otmd_results(
-                                *otmd_loaded, start_date=otmd_start_date, segments=otmd_segments)
-                            milestone_view.pop("generation_error", None)
-                            generated = True
+                            updated_kpi = build_otmd_results(
+                                *otmd_loaded, start_date=otmd_start_date, segments=segments,
+                                projects_only=projects_only, render_outputs=False)
+                            if milestone_view.get(result_key) is not None:
+                                milestone_view[result_key]["downloads_current"] = False
+                            else:
+                                initialized_results = True
+                            milestone_view[result_key] = updated_kpi
+                            clear_generation_error("otmd", error_key)
                         except Exception as exc:
-                            milestone_view["generation_error"] = f"Unable to generate OTMD chart: {exc}"
-                        milestone_view.pop("projects_error", None)
-                        if OTMD_GATE in otmd_milestones:
-                            try:
-                                milestone_view["projects_result"] = build_otmd_results(
-                                    *otmd_loaded, start_date=otmd_start_date, segments=pot_segments, projects_only=True)
-                                generated = True
-                            except Exception as exc:
-                                milestone_view["projects_error"] = f"Unable to generate Projects on-time chart: {exc}"
-                        else:
-                            milestone_view.pop("projects_result", None)
-                if generated:
+                            label = "Projects on-time" if projects_only else "OTMD"
+                            milestone_view[error_key] = f"Unable to generate {label} chart: {exc}"
+                            milestone_view[error_key + "_fingerprint"] = fingerprint
+                if initialized_results:
+                    # Mount the filters for the initial result tab before displaying it.
                     st.rerun()
-            for chart_view in [view, *([portfolio_state("otmd")] if mode == "ipd" else [])]:
-                if chart_view.get("generation_error"):
-                    st.error(chart_view["generation_error"])
+            show_generation_error(mode, ready=project_ready)
+            if mode == "ipd":
+                show_generation_error("otmd", ready=otmd_ready)
+                show_generation_error("otmd", "projects_error", ready=otmd_ready)
             result = view.get("result")
-            stale = result is not None and (bool(view.get("upload_error")) or scope_error is not None or options is None or
+            stale = result is not None and (bool(view.get("upload_error") or view.get("generation_error")) or
+                                            scope_error is not None or options is None or
                                             result["fingerprint"] != settings_key(source, sheet, options))
+            if result is not None:
+                result["downloads_current"] = not stale
             if scope_error and not otmd_active:
                 st.warning(scope_error)
             if stale and not otmd_active:
-                st.warning("Settings changed. Generate charts to apply them. "
+                st.warning("Charts could not be updated for the current workbook settings or filters. "
                            "Previous project results are shown; project downloads are disabled.")
             if result is not None:
                 show_results(result, stale, otmd_start_date, otmd_segments, pot_segments)
             elif (mode == "ipd" and portfolio_state("otmd").get("source") is not None and
-                  (view.get("source") is None or portfolio_state("otmd").get("result") is not None)):
+                  (view.get("source") is None or any(portfolio_state("otmd").get(key) is not None
+                                                   for key in ("result", "projects_result")))):
                 with st.container(border=True, key="results"):
-                    if portfolio_state("otmd").get("result") is None:
+                    if not any(portfolio_state("otmd").get(key) is not None for key in ("result", "projects_result")):
                         show_otmd(otmd_start_date, otmd_segments)
                     else:
                         navigation = Controls("otmd", "navigation")
                         tab_key = navigation.prefix + "active_tab"
                         if tab_key not in st.session_state:
-                            st.session_state[tab_key] = navigation.values.get("active_tab", OTMD_TAB)
+                            default_tab = OTMD_TAB if portfolio_state("otmd").get("result") is not None else POT_TAB
+                            st.session_state[tab_key] = navigation.values.get("active_tab", default_tab)
                         tabs = st.tabs(ON_TIME_TABS, key=tab_key, on_change="rerun")
                         navigation.values["active_tab"] = st.session_state[tab_key]
                         for label, tab in zip(ON_TIME_TABS, tabs):
@@ -3660,8 +4189,8 @@ def main():
                                 with tab:
                                     show_otmd(otmd_start_date, pot_segments if label == POT_TAB else otmd_segments,
                                               projects_only=label == POT_TAB)
-            else:
-                show_empty_portfolio(mode, loaded, scope_error)
+            elif loaded is None:
+                show_empty_portfolio(mode)
     st.html('<div class="portfolio-footer">Portfolio Analysis · Type 0 &amp; IPD · Refreshing the page starts a new workspace</div>')
 
 
